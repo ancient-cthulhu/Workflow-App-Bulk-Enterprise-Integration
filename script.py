@@ -1935,44 +1935,227 @@ def update_veracode_yml_in_repo(
 # Org discovery
 # ---------------------------------------------------------------------------
 
-def list_orgs_graphql(api_base: str, token: str, enterprise: str) -> list[str] | None:
-    try:
-        graphql_url = (
-            "https://api.github.com/graphql"
-            if "api.github.com" in api_base
-            else f"{api_base.rstrip('/')}/graphql"
-        )
-        query = """
-        query($enterprise: String!, $cursor: String) {
-          enterprise(slug: $enterprise) {
-            organizations(first: 100, after: $cursor) {
-              nodes { login }
-              pageInfo { hasNextPage endCursor }
-            }
-          }
+# GitHub kills any GraphQL request that takes >10s server-side and returns
+# 502/504 "We couldn't respond to your request in time" (and bills extra
+# points for it). A timed-out page is retried from the SAME cursor with a
+# halved page size, so progress is never lost and a large enterprise degrades
+# to smaller pages instead of failing discovery.
+_ORG_PAGE_SIZE_DEFAULT = 100          # GraphQL max for first/last
+_ORG_PAGE_SIZE_MIN = 5
+_ORG_PAGE_MAX_ATTEMPTS = 8            # consecutive failures on one page before giving up
+_GRAPHQL_TIMEOUT_MARKERS = ("couldn't respond to your request in time", "timeout", "timedout")
+
+
+class OrgDiscoveryError(RuntimeError):
+    """Org discovery failed in a way that is not 'slug wrong / no orgs'."""
+
+
+def _warn_if_discovery_incomplete(
+    found: int,
+    hidden: int,
+    duplicates: int,
+    total_first: int | None,
+    total_last: int | None,
+) -> None:
+    """Compare what pagination returned with GitHub's organizations.totalCount
+    and warn (never stop) if the list cannot be verified as complete."""
+    problems: list[str] = []
+    if total_first is None or total_last is None:
+        problems.append("GitHub did not return organizations.totalCount, so completeness "
+                        "cannot be verified")
+    else:
+        if total_first != total_last:
+            problems.append(f"totalCount changed during pagination ({total_first} -> "
+                            f"{total_last}); orgs were added or removed mid-run")
+        if found + hidden != total_last:
+            problems.append(f"GitHub reports totalCount={total_last} but pagination returned "
+                            f"{found} visible + {hidden} hidden = {found + hidden}")
+    if duplicates:
+        problems.append(f"{duplicates} duplicate org(s) seen across pages (list shifted "
+                        f"during pagination)")
+    if hidden:
+        problems.append(f"{hidden} org(s) are hidden from this token (usually SAML SSO not "
+                        f"authorized for the PAT on those orgs) and will NOT be processed")
+
+    if not problems:
+        tprint(f"[OK] Discovery verified complete: {found} orgs == totalCount {total_last}")
+        return
+    tprint("  [WARNING] Org discovery could not be verified as complete:\n"
+           + "\n".join(f"    - {p}" for p in problems))
+    tprint("  [WARNING] Orgs not in the discovered list are out of scope for this run. "
+           "Re-run, or review out/orgs.txt and use --orgs-file.")
+
+
+def graphql_url_for(api_base: str) -> str:
+    """GitHub.com: api.github.com/graphql. GHES: https://HOST/api/graphql
+    (NOT /api/v3/graphql). GHE.com data residency: api.SUB.ghe.com/graphql."""
+    base = api_base.rstrip("/")
+    if "api.github.com" in base:
+        return "https://api.github.com/graphql"
+    if base.endswith("/api/v3"):
+        return base[: -len("/v3")] + "/graphql"
+    return f"{base}/graphql"
+
+
+def _looks_like_graphql_timeout(errors: list[Any]) -> bool:
+    for e in errors:
+        text = f"{(e or {}).get('type', '')} {(e or {}).get('message', '')}".lower()
+        if any(m in text for m in _GRAPHQL_TIMEOUT_MARKERS):
+            return True
+    return False
+
+
+def list_orgs_graphql(
+    api_base: str,
+    token: str,
+    enterprise: str,
+    page_size: int = _ORG_PAGE_SIZE_DEFAULT,
+) -> list[str] | None:
+    """Return all org logins in the enterprise.
+
+    After pagination the result is checked against GitHub's totalCount and a
+    warning is printed if it cannot be verified complete.
+
+    Returns None only when GitHub says the enterprise is not visible (wrong
+    slug or missing read:enterprise). Raises OrgDiscoveryError on timeouts or
+    other failures that persist after adaptive retries.
+    """
+    graphql_url = graphql_url_for(api_base)
+    query = """
+    query($enterprise: String!, $first: Int!, $cursor: String) {
+      enterprise(slug: $enterprise) {
+        organizations(first: $first, after: $cursor) {
+          totalCount
+          nodes { login }
+          pageInfo { hasNextPage endCursor }
         }
-        """
-        all_orgs: list[str] = []
-        cursor: str | None = None
-        while True:
-            variables: dict[str, Any] = {"enterprise": enterprise}
-            if cursor:
-                variables["cursor"] = cursor
-            r = request("POST", graphql_url, token, json={"query": query, "variables": variables}, graphql=True)
-            if r.status_code != 200:
+      }
+    }
+    """
+    page_size = max(_ORG_PAGE_SIZE_MIN, min(int(page_size), _ORG_PAGE_SIZE_DEFAULT))
+    all_orgs: list[str] = []
+    seen: set[str] = set()
+    skipped_null = 0
+    duplicates = 0
+    total_first: int | None = None
+    total_last: int | None = None
+    cursor: str | None = None
+    attempts = 0
+    page_no = 0
+
+    def fail_or_backoff(reason: str, shrink: bool) -> None:
+        nonlocal attempts, page_size
+        attempts += 1
+        if attempts >= _ORG_PAGE_MAX_ATTEMPTS:
+            raise OrgDiscoveryError(
+                f"Enterprise org discovery failed on page {page_no + 1} after {attempts} attempts "
+                f"(last: {reason}; page size {page_size}; {len(all_orgs)} orgs fetched so far). "
+                f"Retry later, or pass --orgs-file to bypass discovery."
+            )
+        if shrink and page_size > _ORG_PAGE_SIZE_MIN:
+            new_size = max(_ORG_PAGE_SIZE_MIN, page_size // 2)
+            tprint(f"  [GRAPHQL] {reason} at page size {page_size}; retrying same page "
+                   f"with page size {new_size} (attempt {attempts + 1}/{_ORG_PAGE_MAX_ATTEMPTS})")
+            page_size = new_size
+        else:
+            tprint(f"  [GRAPHQL] {reason}; retrying same page "
+                   f"(attempt {attempts + 1}/{_ORG_PAGE_MAX_ATTEMPTS})")
+        time.sleep(_fault_backoff(min(attempts - 1, 4)))
+
+    while True:
+        variables: dict[str, Any] = {"enterprise": enterprise, "first": page_size}
+        if cursor:
+            variables["cursor"] = cursor
+        try:
+            # max_retries=1: 5xx is handled here so a timed-out page is not
+            # re-sent at the same size (each timeout costs extra points).
+            # 403/429 rate limits are still retried inside request().
+            r = request("POST", graphql_url, token, max_retries=1, graphql=True,
+                        json={"query": query, "variables": variables})
+        except requests.exceptions.Timeout:
+            fail_or_backoff("client-side timeout", shrink=True)
+            continue
+        except requests.exceptions.RequestException as exc:
+            fail_or_backoff(f"network error: {str(exc)[:80]}", shrink=False)
+            continue
+
+        if r.status_code in (502, 504):
+            fail_or_backoff(f"HTTP {r.status_code} (GitHub 10s GraphQL timeout)", shrink=True)
+            continue
+        if r.status_code >= 500:
+            fail_or_backoff(f"HTTP {r.status_code}", shrink=False)
+            continue
+        if r.status_code in (401, 403):
+            raise OrgDiscoveryError(
+                f"GraphQL returned HTTP {r.status_code}: {r.text[:200]}. "
+                f"Check the token and its 'read:enterprise' scope / SSO authorization."
+            )
+        if r.status_code != 200:
+            raise OrgDiscoveryError(f"GraphQL returned HTTP {r.status_code}: {r.text[:200]}")
+
+        try:
+            payload = r.json()
+        except ValueError:
+            fail_or_backoff("non-JSON response", shrink=False)
+            continue
+
+        errors = payload.get("errors") or []
+        ent = (payload.get("data") or {}).get("enterprise")
+        conn = (ent or {}).get("organizations")
+        if conn is None:
+            if _looks_like_graphql_timeout(errors):
+                fail_or_backoff("GraphQL timeout error", shrink=True)
+                continue
+            if ent is None:
+                # NOT_FOUND / FORBIDDEN on the enterprise itself: slug or scope.
+                if errors:
+                    tprint(f"  [GRAPHQL] {'; '.join(str(e.get('message', e))[:160] for e in errors[:3])}")
+                if all_orgs:
+                    raise OrgDiscoveryError(
+                        f"Enterprise became unreadable mid-pagination after {len(all_orgs)} orgs."
+                    )
                 return None
-            data = r.json()
-            if "errors" in data or not data.get("data", {}).get("enterprise"):
-                return None
-            orgs_data = data["data"]["enterprise"]["organizations"]
-            all_orgs.extend(node["login"] for node in orgs_data.get("nodes", []) if "login" in node)
-            page_info = orgs_data.get("pageInfo", {})
-            if not page_info.get("hasNextPage"):
-                break
-            cursor = page_info.get("endCursor")
-        return all_orgs or None
-    except Exception:
+            raise OrgDiscoveryError(f"Unexpected GraphQL response: {str(payload)[:300]}")
+
+        # Partial data: GitHub nulls individual nodes it will not show this
+        # token (e.g. SAML SSO not authorized for that org) and lists them in
+        # `errors`. Keep the visible orgs instead of discarding the whole run.
+        for node in conn.get("nodes") or []:
+            login = (node or {}).get("login")
+            if not login:
+                skipped_null += 1
+                continue
+            if login in seen:
+                duplicates += 1
+                continue
+            seen.add(login)
+            all_orgs.append(login)
+
+        tc = conn.get("totalCount")
+        if isinstance(tc, int):
+            if total_first is None:
+                total_first = tc
+            total_last = tc
+
+        attempts = 0
+        page_no += 1
+        page_info = conn.get("pageInfo") or {}
+        if not page_info.get("hasNextPage"):
+            break
+        next_cursor = page_info.get("endCursor")
+        if not next_cursor or next_cursor == cursor:
+            raise OrgDiscoveryError(
+                f"GraphQL reported hasNextPage but no new cursor after {len(all_orgs)} orgs."
+            )
+        cursor = next_cursor
+        if page_no % 10 == 0:
+            tprint(f"  [GRAPHQL] ...{len(all_orgs)} orgs discovered so far")
+
+    if not all_orgs and not skipped_null:
         return None
+    _warn_if_discovery_incomplete(len(all_orgs), skipped_null, duplicates,
+                                  total_first, total_last)
+    return all_orgs or None
 
 
 def list_orgs(api_base: str, token: str, enterprise: str | None, orgs_file: str | None) -> list[str]:
@@ -2941,7 +3124,6 @@ def main() -> None:
                     help="Resume from the last checkpoint saved in checkpoint.json.")
     ap.add_argument("--workers", type=int, default=1, metavar="N",
                     help="Number of parallel worker threads (default: 1). Recommended: 3-5.")
-
     args = ap.parse_args()
 
     if args.workers < 1:
@@ -3122,7 +3304,11 @@ def main() -> None:
     outdir = Path(args.out)
     outdir.mkdir(parents=True, exist_ok=True)
 
-    all_orgs = list_orgs(api_base, token, args.enterprise, args.orgs_file)
+    try:
+        all_orgs = list_orgs(api_base, token, args.enterprise, args.orgs_file)
+    except OrgDiscoveryError as exc:
+        print(f"\n[ERROR] {exc}", file=sys.stderr)
+        sys.exit(2)
 
     if args.orgs_file and args.enterprise:
         try:
