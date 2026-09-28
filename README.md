@@ -142,16 +142,32 @@ Admin credentials are never stored in any org. Service account credentials are w
 
 ## GitHub Token Permissions
 
-|Operation                        |Required Scopes                                                                                                                                        |
-|---------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------|
-|Dry-run                          |`read:org`, `admin:org` (`admin:org` required to check secret status and the Actions allowlist - without it both show as `no_permission` in the report)|
-|`--enterprise` (org discovery)   |+ `read:enterprise`                                                                                                                                    |
-|`--import-repo` / `--set-teams-*`|+ `repo`, `workflow`                                                                                                                                   |
-|`--update-veracode-yml`          |+ `repo`, `workflow`                                                                                                                                   |
-|`--fix-repos`                    |+ `repo`, `workflow`                                                                                                                                   |
-|`--set-secrets`                  |`admin:org` *(already covered above)*                                                                                                                  |
+Use a **personal access token (classic)**. The scopes below are classic PAT scopes.
 
-Full rollout with all flags: `read:org`, `admin:org`, `read:enterprise`, `repo`, `workflow`
+### Minimum scopes
+
+|Run type                                   |Scopes                                                        |
+|-------------------------------------------|--------------------------------------------------------------|
+|Dry-run                                    |`admin:org`, `repo`, + `read:enterprise` if using `--enterprise`|
+|Apply, any combination of flags            |`admin:org`, `repo`, `workflow`, + `read:enterprise` if using `--enterprise`|
+
+**Full rollout with all flags:** `admin:org`, `repo`, `workflow`, `read:enterprise`
+
+`read:org` is not needed separately: `admin:org` includes it.
+
+### Why each scope is needed
+
+|Scope            |Used for                                                                                          |Endpoints                                                                                                   |
+|-----------------|--------------------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------|
+|`read:enterprise`|Org discovery with `--enterprise`                                                                 |GraphQL `enterprise { organizations }`                                                                      |
+|`admin:org`      |Secret status and `--set-secrets`; Actions allowlist check; app installation check; org details  |`/orgs/{org}/actions/secrets/*`, `/orgs/{org}/actions/permissions*`, `/orgs/{org}/installations`, `/orgs/{org}`|
+|`repo`           |Reading and creating the private `veracode` repo, writing `veracode.yml`, setting the default branch, `git push --mirror` |`/orgs/{org}/repos`, `/repos/{org}/veracode/*`                                                              |
+|`workflow`       |Writing files under `.github/workflows` (teams injection, import, `--fix-repos`); GitHub rejects the mirror push of workflow files without it |`/repos/{org}/veracode/contents/.github/workflows/*`, `git push --mirror`                                   |
+
+### Other requirements
+
+- **SAML SSO:** if orgs enforce SAML SSO, authorize the token for each one (`Settings > Developer settings > Personal access tokens > Configure SSO`). Orgs the token is not authorized for are hidden during discovery and reported in the discovery completeness warning.
+- **Role:** the token's user must be an **owner** of each org. GitHub requires org owner for the app installation list and full org details, and in practice org secrets and Actions policy need admin rights too.
 
 -----
 
@@ -402,6 +418,26 @@ The script resolves orgs in this order:
 1. **`--orgs-file FILE`** - explicit list used directly as the org scope, one org per line.
 1. **No flags** - falls back to `/user/orgs` (all orgs accessible to the token).
 
+### Large enterprises and GraphQL timeouts
+
+GitHub terminates any GraphQL request that takes more than 10 seconds and returns `502`/`504` ("We couldn't respond to your request in time"), and timeouts cost extra rate-limit points. Enterprise discovery is cursor-paginated and handles this:
+
+- A timed-out page is retried **from the same cursor** with the page size halved (100, 50, 25, 12, 6, 5), so already-fetched orgs are never lost.
+- Up to 8 consecutive attempts per page with backoff; after that the run stops with an explicit error (not the "wrong slug" message). Use `--orgs-file` to bypass discovery if GitHub stays degraded.
+- Orgs GitHub hides from the token (typically SAML SSO not authorized for the PAT) are skipped with a warning instead of failing discovery.
+- On GHES the GraphQL endpoint is `https://HOST/api/graphql`, derived automatically from `--api-base https://HOST/api/v3`.
+
+### Discovery completeness check
+
+After paginating, the script compares what it received with GitHub's own `organizations.totalCount` for the enterprise. If everything matches it prints `[OK] Discovery verified complete: N orgs == totalCount N`. Otherwise it prints a warning and continues with the orgs it found. The warning lists the cause:
+
+- `totalCount` missing, or changed between the first and last page (orgs added or removed mid-run)
+- visible + hidden orgs does not equal `totalCount`
+- an org appeared twice (the list shifted during pagination)
+- orgs hidden from the token (usually SAML SSO not authorized for the PAT); these are not processed
+
+If you see this warning before an apply run, re-run discovery or review `out/orgs.txt` and pass it with `--orgs-file` (without `--enterprise`).
+
 -----
 
 ## Output Files
@@ -593,16 +629,6 @@ python script.py --apply --enterprise YOUR-ENTERPRISE \
 ### Log output with multiple workers
 
 Per-org log lines are printed atomically but may arrive out of order relative to the org list (this is expected). The `[N/TOTAL]` progress prefix on each line shows the submission order. The audit report always contains one entry per org regardless of completion order.
-
------
-
-## Reliability Notes
-
-- **Git operations are bounded.** `git clone` and `git push --mirror` run with a 900s timeout (`_GIT_SUBPROCESS_TIMEOUT`). Without it a stalled connection blocks a worker thread permanently with no log line. Raise it if your integration repo is large or your link is slow.
-- **Tokens are redacted from all failure paths.** The mirror-import push URL embeds the PAT. Both the push-failure and exception paths scrub it, so it never reaches the console or `audit_report_*.json`.
-- **Post-import branch polling backs off.** Waiting for `main` to appear starts at 10s and doubles to 60s, keeping the same 15-minute ceiling while spending ~17 requests instead of ~90 per slow org.
-- **Connections are pooled per thread.** Each worker holds one `requests.Session`; cookies are blocked so behaviour matches the previous per-call requests.
-- **Duplicate reads are avoided.** `--fix-repos` reads `GET /repos/{org}/{repo}` once per org instead of three times, and reuses the `veracode.yml` response it already fetched rather than re-fetching it before writing.
 
 -----
 
