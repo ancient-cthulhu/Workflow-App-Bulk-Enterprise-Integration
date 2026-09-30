@@ -36,7 +36,7 @@ Also check:
 
 ## Your orgs file
 
-Create `orgs.txt` with one org login per line. Lines starting with `#` are ignored.
+`orgs.txt` has one org login per line. Lines starting with `#` are ignored. For a single org, the file has one line.
 
 ```
 # Payments business unit
@@ -44,7 +44,26 @@ acme-payments
 acme-payments-mobile
 ```
 
-For a single org, the file has one line. Every command below uses `--orgs-file orgs.txt`, so the script only ever touches the orgs in this file.
+**Don't know your org list? Let the dry run build it.** Run a dry run with no `--orgs-file`:
+
+```bash
+python script.py
+```
+
+With no scope flag, the script lists every org your token's user is a member of and writes it to `out/orgs.txt`. It changes nothing. Then copy that file and trim it to the orgs you are onboarding:
+
+```bash
+cp out/orgs.txt orgs.txt
+# edit orgs.txt: keep only the orgs you own and want to onboard now
+```
+
+Things to know:
+
+- **Membership is not ownership.** The list includes every org you belong to, but you can only onboard orgs you **own**. Remove the rest.
+- **Every dry run overwrites `out/orgs.txt`** with the orgs of that run. Never edit `out/orgs.txt` in place or point `--orgs-file` at it for your real list. Keep your edited copy outside `out/`, as `orgs.txt` above.
+- **Never run the apply without `--orgs-file`.** Without it the apply falls back to every org you are a member of, not just the ones you picked.
+
+Every command below uses `--orgs-file orgs.txt`, so the script only ever touches the orgs in your edited file.
 
 ## Step 1: Dry run
 
@@ -84,7 +103,7 @@ Example `teams_map.csv`:
 
 Use one team name per row. `--create-teams` and `--link-teams-to-workspaces` treat a comma-separated value as a single team name.
 
-`teams_map.csv` is only generated when it does not exist yet. If you later add orgs to `orgs.txt`, add their rows by hand or delete the file and re-run the dry run.
+`teams_map.csv` is only generated when it does not exist yet. If it was created by the untrimmed dry run, it lists orgs you removed; those rows are ignored, because only orgs in `orgs.txt` are processed. If you later add orgs to `orgs.txt`, add their rows by hand or delete the file and re-run the dry run.
 
 ## Step 2: Onboarding run
 
