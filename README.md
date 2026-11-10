@@ -11,7 +11,7 @@ For each organization, the script can:
 1. Create the `veracode` integration repository and mirror-import the Veracode workflow template
 1. Inject a customized `veracode.yml` onboarding configuration
 1. Create teams on the Veracode platform via the Identity API (if they do not already exist)
-1. Inject `teams:` parameter into workflow files
+1. Inject `teams:` parameter into workflow files, and switch the IaC/Secrets workflow to the Veracode CLI with role-based access control (app profile + teams)
 1. Create a Veracode SCA workspace, generate a unique agent token, and set GitHub Actions secrets
 1. Link each org's team to its SCA workspace so the team can see scan results (`--link-teams-to-workspaces`)
 
@@ -182,6 +182,7 @@ Use a **personal access token (classic)**. The scopes below are classic PAT scop
 |`--set-teams-file FILE`       |Inject per-org team values from `teams_map.csv`. Blank rows are skipped.                                                                                                                                                                                                                                                                                                                   |
 |`--set-teams-hybrid FILE`     |Same as `--set-teams-file` but blank rows fall back to the org name                                                                                                                                                                                                                                                                                                                        |
 |`--team-prefix PREFIX`        |Prepend `PREFIX` to every resolved teams value. Applied after `--set-teams-auto/file/hybrid`. Example: `--team-prefix "gh-"` turns `acme-dev` into `gh-acme-dev`. Orgs with no resolved teams value (blank file row on the `--set-teams-file FILE` option) are not affected.                                                                                                               |
+|`--skip-iac-rbac`             |Leave the IaC/Secrets workflow untouched. By default, `--set-teams-*` (and `--fix-repos` with a teams mode) convert it to the Veracode CLI with RBAC. See [IaC/Secrets RBAC](#iacsecrets-rbac).|
 |`--create-teams`              |Create teams on the Veracode platform via the Identity API if they do not already exist. Uses the resolved teams value from `--set-teams-auto/file/hybrid` (after prefix). Requires `VERACODE_API_ID` and `VERACODE_API_KEY`. Must be combined with one of the `--set-teams-*` flags. See [Platform Team Creation](#platform-team-creation).                                               |
 |`--set-secrets`               |Set `VERACODE_API_ID`, `VERACODE_API_KEY`, `VERACODE_AGENT_TOKEN` per org. Always overwrites all three - safe to re-run for annual credential rotation. The SCA agent token is regenerated via `token:regenerate` on each run, invalidating the previous one.                                                                                                                              |
 |`--link-teams-to-workspaces`  |Associate each org's team with its SCA workspace so the team can see scan results. Resolves the workspace by org name and the team by the resolved teams value (after prefix); creates neither. Requires Admin `VERACODE_API_ID` and `VERACODE_API_KEY` and one of the `--set-teams-*` flags. Composes with `--create-teams` and `--set-secrets`. See [Link Teams to Workspaces](#link-teams-to-workspaces).|
@@ -221,7 +222,7 @@ Flagged orgs and their missing patterns are written to `actions_allowlist_issues
 
 1. **Default branch** - sets `main` as default if it is not already
 1. **`veracode.yml`** - adds or updates the file if missing (uses `--update-veracode-yml FILE` if provided, otherwise falls back to the local `veracode.yml` next to the script)
-1. **Teams injection** - injects or updates `teams:` in workflow files if a `--set-teams-*` flag is active
+1. **Teams injection** - injects or updates `teams:` in workflow files if a `--set-teams-*` flag is active, and converts the IaC/Secrets workflow to the Veracode CLI with RBAC (unless `--skip-iac-rbac`)
 
 If `main` does not exist, or both workflow files are missing on `main`, the repo is treated as a broken import and is **re-imported from upstream** (in apply mode), after which the default branch is set and the steps above run. Compatible with `--dry-run` to audit without making changes. Cannot be combined with `--import-repo` in the same run.
 
@@ -352,6 +353,33 @@ The teams map is a lookup table, not a scope filter. Only orgs that are being pr
 
 > **Note on comma-separated values:** A `teams` value may contain multiple comma-separated names for workflow injection. `--create-teams` and `--link-teams-to-workspaces` treat the whole value as a single team name (matching the existing team-creation behavior); they do not split it into separate teams. Use single team names per org if you rely on platform team creation or workspace linking.
 
+### IaC/Secrets RBAC
+
+The upstream `veracode-iac-secrets-scan.yml` runs the `veracode/container_iac_secrets_scanning` action, which cannot link results to an application profile. Without that link, container and IaC results are visible only to Security Leads.
+
+When a `--set-teams-*` mode is active (and `--skip-iac-rbac` is not set), the script replaces that action step in each org's `veracode` repo with a Veracode CLI step that runs:
+
+```bash
+veracode scan --source ./ --type directory ... \
+  --app-name "<profile name>" --create-app --teams "<teams>"
+```
+
+- `--app-name` is the same application profile the static and SCA scans use (`profile_name`, default `<org>/<repo>`), so IaC findings are linked to the same profile.
+- `--teams` is the resolved teams value (after `--team-prefix`), with spaces around commas removed as the CLI requires. It is stored in the step as `VERACODE_TEAMS: "<teams>"` and kept in sync on re-runs.
+- `--create-app` creates the profile on the first scan if it does not exist yet.
+
+Everything else matches the action: the latest CLI is installed from `tools.veracode.com` on every run, the IaC policy is downloaded and applied, `break_build_policy_findings` and `break_build_on_error` are honored, and `results.json`, `results.txt` and the SBOM files are uploaded as the `Veracode Container IaC Secrets Scanning Results` artifact. The step stops with a clear error if the installed CLI is older than 2.55.0, the first version with RBAC for container and IaC scans.
+
+The conversion is idempotent. The script recognizes converted files by the `# veracode-iac-rbac` marker and then only updates `VERACODE_TEAMS`. If the action step is not found (for example, a customized workflow), the file is left unchanged and the run log says so. A re-import from upstream (`--fix-repos`) restores the action; the same run converts it again.
+
+Prerequisites on the Veracode side (see Veracode's *Role-based access control for container and IaC Security* page):
+
+- The teams must exist on the platform (`--create-teams`).
+- The API credentials in the org's `VERACODE_API_ID`/`VERACODE_API_KEY` secrets need the Upload and Scan API or Upload API - Submit Only role and the `createApplicationProfile` permission. To create a profile assigned to teams, the account must be a member of those teams.
+- Container and IaC results appear under **Container & IaC Analysis** in the Veracode Platform, not in the application profile section.
+
+> **Pilot first:** run the conversion on one org with `--orgs-file`, trigger an IaC scan twice (first run creates the profile, second run uses the existing one), and confirm that the team can see the findings before rolling out widely.
+
 -----
 
 ## veracode.yml Configuration
@@ -471,8 +499,13 @@ If you see this warning before an apply run, re-run discovery or review `out/org
   },
   "teams_injection": {
     "success": true,
-    "action": "teams_updated_2_files",
-    "value": "gh-acme-dev"
+    "action": "teams_updated_3_files",
+    "value": "gh-acme-dev",
+    "files": {
+      "veracode-sandbox-scan.yml": "teams_updated",
+      "veracode-policy-scan.yml": "teams_updated",
+      "veracode-iac-secrets-scan.yml": "converted"
+    }
   },
   "workflow_app": {
     "installed": true,

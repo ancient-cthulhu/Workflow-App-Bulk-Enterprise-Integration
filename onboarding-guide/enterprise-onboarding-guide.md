@@ -93,7 +93,7 @@ python script.py --apply \
 | Flag | What it does |
 | --- | --- |
 | `--import-repo` | Creates the private `veracode` repo, imports the workflow templates, sets `main` as default branch, adds the onboarding `veracode.yml` (build gating off). |
-| `--set-teams-*` | Adds `teams:` to the policy and sandbox scan workflows. |
+| `--set-teams-*` | Adds `teams:` to the policy and sandbox scan workflows, and switches the IaC/Secrets workflow to the Veracode CLI with `--app-name`, `--create-app` and `--teams` (RBAC). Add `--skip-iac-rbac` to leave the IaC workflow unchanged. |
 | `--team-prefix` | Optional prefix on every team name. |
 | `--create-teams` | Creates the team on the Veracode platform if it does not exist. |
 | `--set-secrets` | Creates the SCA workspace and agent token per org and sets the three Veracode org secrets. |

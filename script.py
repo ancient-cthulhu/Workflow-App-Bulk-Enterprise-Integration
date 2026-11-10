@@ -523,6 +523,7 @@ class RunContext:
     total_orgs: int
     report_path: Path
     checkpoint_file: Path
+    do_iac_rbac: bool = True
     stats: RunStats = field(default_factory=RunStats)
     stats_lock: threading.Lock = field(default_factory=threading.Lock)
     rows_lock: threading.Lock = field(default_factory=threading.Lock)
@@ -1578,6 +1579,7 @@ def check_repo_health(
     web_base: str = "https://github.com",
     cached_clone_dir: str | None = None,
     log: Callable[[str], None] = tprint,
+    include_iac_rbac: bool = False,
 ) -> RepoHealthResult:
     result = RepoHealthResult(org=org)
 
@@ -1687,6 +1689,7 @@ def check_repo_health(
                 api_base, org, repo, token, teams_value,
                 update_existing=True,
                 log=log,
+                include_iac_rbac=include_iac_rbac,
             )
             result.teams_action = teams_msg
             if not teams_ok and teams_msg not in ("no_workflow_files_found", "teams_already_current"):
@@ -1737,22 +1740,410 @@ def _update_teams_value(content: str, teams_value: str) -> tuple[str, bool]:
     return new_content, changed
 
 
+# ---------------------------------------------------------------------------
+# IaC/Secrets workflow: Veracode CLI with RBAC (--app-name/--create-app/--teams)
+# ---------------------------------------------------------------------------
+# The upstream workflow runs veracode/container_iac_secrets_scanning, which has
+# no way to link results to an application profile. RBAC for container and IaC
+# scans needs `veracode scan --app-name ... --create-app --teams ...` (CLI
+# 2.55.0+), so the action step is replaced with the CLI step block below. The
+# block is identical to the one in the reference
+# .github/workflows/veracode-iac-secrets-scan.yml shipped with this script.
+
+IAC_WORKFLOW_PATH = ".github/workflows/veracode-iac-secrets-scan.yml"
+_IAC_RBAC_MARKER = "# veracode-iac-rbac"
+_IAC_BLOCK_INDENT = 6
+_IAC_TEAMS_PLACEHOLDER = '          VERACODE_TEAMS: ""\n'
+_IAC_ACTION_USES_RE = re.compile(
+    r"^(?P<lead>[ \t]*(?:-[ \t]+)?)uses:[ \t]*[\"']?veracode/container_iac_secrets_scanning@",
+    re.IGNORECASE,
+)
+_YAML_ITEM_RE = re.compile(r"^(?P<indent>[ \t]*)-(?:[ \t]|$)")
+_IAC_TEAMS_LINE_RE = re.compile(r"^(?P<prefix>[ \t]+VERACODE_TEAMS:[ \t]*)(?P<value>[^\n]*?)[ \t]*$", re.MULTILINE)
+
+_IAC_RBAC_STEP_BLOCK = r"""      # veracode-iac-rbac (managed by Workflow-App-Bulk-Enterprise-Integration script.py)
+      # Runs the Veracode CLI directly instead of veracode/container_iac_secrets_scanning so
+      # IaC/secrets results are linked to the application profile and its teams (RBAC).
+      # Requires Veracode CLI 2.55.0 or later; the latest CLI is installed on every run.
+      - name: Run Veracode IaC/Secrets Scanning
+        id: veracode_iac_scan
+        shell: bash
+        env:
+          VERACODE_API_KEY_ID: ${{ secrets.VERACODE_API_ID }}
+          VERACODE_API_KEY_SECRET: ${{ secrets.VERACODE_API_KEY }}
+          # Application profile used by the static and SCA scans (default: <org>/<repo>).
+          VERACODE_APP_NAME: ${{ github.event.client_payload.user_config.profile_name || github.event.client_payload.repository.full_name }}
+          # Comma-separated Veracode team names. Empty: the profile is assigned to all teams of the API user.
+          VERACODE_TEAMS: ""
+          VERACODE_POLICY: ${{ github.event.client_payload.policy_name }}
+          FAIL_BUILD: ${{ github.event.client_payload.user_config.break_build_policy_findings }}
+          FAIL_BUILD_ON_ERROR: ${{ github.event.client_payload.user_config.break_build_on_error }}
+          DEBUG: ${{ github.event.client_payload.user_config.debug }}
+          MIN_CLI_VERSION: "2.55.0"
+        run: |
+          # GitHub runs bash with -e; exit codes are handled explicitly below.
+          set +e
+          set -uo pipefail
+
+          lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+          is_true() { [ "$(lower "${1:-}")" = "true" ]; }
+          trim() { local s="$1"; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"; printf '%s' "$s"; }
+          esc() { local s="$1"; s="${s//%/%25}"; s="${s//$'\r'/%0D}"; s="${s//$'\n'/%0A}"; printf '%s' "$s"; }
+          debug() { if is_true "${DEBUG:-false}"; then echo "[debug] $*"; fi; }
+
+          SCAN_ERROR=false
+          POLICY_EXIT_FAILED=false
+          POLICY_FAILED=false
+          scan_error() { echo "::error::$(esc "$1")"; SCAN_ERROR=true; }
+
+          # Same encoding as the action (JavaScript encodeURIComponent).
+          urlencode() {
+            local LC_ALL=C
+            local s="$1" out="" c i
+            for (( i = 0; i < ${#s}; i++ )); do
+              c="${s:i:1}"
+              case "$c" in
+                [A-Za-z0-9_.~*\'\(\)!-]) out="$out$c" ;;
+                *) printf -v c '%%%02X' "'$c"; out="$out$c" ;;
+              esac
+            done
+            printf '%s' "$out"
+          }
+
+          # Returns 0 when version $1 >= version $2 (major.minor.patch).
+          version_ge() {
+            local a b i x y
+            IFS=. read -r -a a <<< "$1"
+            IFS=. read -r -a b <<< "$2"
+            for i in 0 1 2; do
+              x="${a[i]:-0}"; y="${b[i]:-0}"
+              x="${x%%[!0-9]*}"; y="${y%%[!0-9]*}"
+              x="${x:-0}"; y="${y:-0}"
+              if (( 10#$x > 10#$y )); then return 0; fi
+              if (( 10#$x < 10#$y )); then return 1; fi
+            done
+            return 0
+          }
+
+          native_path() {
+            if command -v cygpath >/dev/null 2>&1; then cygpath -m "$1"; else printf '%s' "$1"; fi
+          }
+
+          BASE_DIR="$(native_path "${RUNNER_TEMP:-${TMPDIR:-/tmp}}")"
+          RESULTS_DIR="$BASE_DIR/veracode-iac-results"
+          POLICY_DIR="$BASE_DIR/veracode-iac-policy"
+          CACHE_DIR="$BASE_DIR/veracode-iac-cache"
+          rm -rf "$RESULTS_DIR" "$POLICY_DIR" "$CACHE_DIR"
+          mkdir -p "$RESULTS_DIR" "$POLICY_DIR" "$CACHE_DIR"
+
+          # --- Install the Veracode CLI (same source as the action) -------------------
+          if [ "${RUNNER_OS:-}" = "Windows" ]; then
+            powershell.exe -NoProfile -Command "Set-ExecutionPolicy AllSigned -Scope Process -Force; iex ((New-Object System.Net.WebClient).DownloadString('https://tools.veracode.com/veracode-cli/install.ps1'))"
+            CLI="$(native_path "${APPDATA:-}")/veracode/veracode.exe"
+          else
+            CLI_DIR="$BASE_DIR/veracode-cli"
+            rm -rf "$CLI_DIR"
+            mkdir -p "$CLI_DIR"
+            (cd "$CLI_DIR" && curl -fsS https://tools.veracode.com/veracode-cli/install | sh)
+            CLI="$CLI_DIR/veracode"
+          fi
+          if [ ! -f "$CLI" ]; then
+            echo "::error::Veracode CLI installation failed: $(esc "$CLI") not found."
+            exit 1
+          fi
+
+          CLI_VERSION="$("$CLI" version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)"
+          CLI_VERSION="${CLI_VERSION#v}"
+          echo "Veracode CLI version: ${CLI_VERSION:-unknown}"
+          if [ -z "$CLI_VERSION" ] || ! version_ge "$CLI_VERSION" "$MIN_CLI_VERSION"; then
+            echo "::error::Veracode CLI ${CLI_VERSION:-unknown} does not support --app-name/--create-app/--teams. Version $MIN_CLI_VERSION or later is required."
+            exit 1
+          fi
+
+          # --- RBAC: link the scan to the application profile and its teams ----------
+          APP_NAME="$(trim "${VERACODE_APP_NAME:-}")"
+          TEAMS="$(printf '%s' "${VERACODE_TEAMS:-}" | tr -d '\r\n' | sed -e 's/[[:space:]]*,[[:space:]]*/,/g' -e 's/,,*/,/g' -e 's/^[[:space:]]*,*//' -e 's/,*[[:space:]]*$//')"
+          rbac_args=()
+          if [ -n "$APP_NAME" ]; then
+            rbac_args=(--app-name "$APP_NAME" --create-app)
+            if [ -n "$TEAMS" ]; then
+              rbac_args+=(--teams "$TEAMS")
+            fi
+            echo "Application profile: $APP_NAME"
+            echo "Teams: ${TEAMS:-<none: all teams of the API user>}"
+          else
+            echo "::warning::No application profile name available; results will only be visible to Security Leads."
+          fi
+
+          # --- Policy (same handling as the action) -----------------------------------
+          POLICY="$(trim "${VERACODE_POLICY:-}")"
+          policy_args=()
+          POLICY_FILE=""
+          if [ -n "$POLICY" ]; then
+            ENCODED_POLICY="$(urlencode "$POLICY")"
+            debug "Policy command: veracode policy get $ENCODED_POLICY"
+            if ! (cd "$POLICY_DIR" && "$CLI" policy get "$ENCODED_POLICY"); then
+              echo "::error::Failed to download policy $(esc "$POLICY")"
+              exit 1
+            fi
+            if [ -f "$POLICY_DIR/$POLICY.rego" ]; then
+              POLICY_FILE="$POLICY_DIR/$POLICY.rego"
+            elif [ -f "$POLICY_DIR/$ENCODED_POLICY.rego" ]; then
+              POLICY_FILE="$POLICY_DIR/$ENCODED_POLICY.rego"
+            else
+              echo "::warning::No matching IaC rules available in policy $(esc "$POLICY"). Proceeding without policy evaluation."
+            fi
+            if [ -n "$POLICY_FILE" ]; then
+              policy_args=(--policy "$POLICY_FILE")
+            fi
+          fi
+
+          # Exit code 3 = scan completed but did not pass policy. Anything else non-zero is an error.
+          run_scan() {
+            local label="$1"; shift
+            echo "Running: veracode $*"
+            "$CLI" "$@"
+            local rc=$?
+            debug "$label exit code: $rc"
+            if [ "$rc" -eq 3 ]; then
+              POLICY_EXIT_FAILED=true
+            elif [ "$rc" -ne 0 ]; then
+              scan_error "Veracode CLI scan failed. Exit code: $rc, Command: veracode $*"
+            fi
+          }
+          run_cli() {
+            echo "Running: veracode $*"
+            "$CLI" "$@"
+            local rc=$?
+            if [ "$rc" -ne 0 ]; then
+              scan_error "Veracode CLI command failed. Exit code: $rc, Command: veracode $*"
+            fi
+          }
+
+          # --- Scans --------------------------------------------------------------------
+          run_scan "json" scan --source ./ --type directory --format json --output "$RESULTS_DIR/results.json" --temp "$CACHE_DIR" ${policy_args[@]+"${policy_args[@]}"} ${rbac_args[@]+"${rbac_args[@]}"}
+          run_scan "table" scan --source ./ --type directory --format table --output "$RESULTS_DIR/results.txt" --temp "$CACHE_DIR" ${policy_args[@]+"${policy_args[@]}"} ${rbac_args[@]+"${rbac_args[@]}"}
+
+          for sbom in "cyclonedx-xml:sbom_cyclonedx_xml.xml" "cyclonedx-json:sbom_cyclonedx_json.json" "spdx-tag-value:sbom_spdx_tag_value.json" "spdx-json:sbom_spdx_json.json" "github:sbom_github.json"; do
+            run_cli sbom --source ./ --type directory --format "${sbom%%:*}" --output "$RESULTS_DIR/${sbom#*:}"
+          done
+
+          # --- Results ------------------------------------------------------------------
+          if [ -f "$RESULTS_DIR/results.txt" ]; then
+            echo "Veracode Container/IaC/Secrets Scan Summary"
+            cat "$RESULTS_DIR/results.txt"
+          else
+            scan_error "Unable to locate scan results file: results.txt"
+          fi
+
+          if is_true "${FAIL_BUILD:-false}"; then
+            if [ "$POLICY_EXIT_FAILED" = true ]; then
+              POLICY_FAILED=true
+            elif [ -f "$RESULTS_DIR/results.txt" ]; then
+              if [ -n "$POLICY_FILE" ]; then
+                if grep -Eq '^[[:space:]]+Failed[[:space:]]+│|│[[:space:]]+Failed[[:space:]]+│' "$RESULTS_DIR/results.txt"; then POLICY_FAILED=true; fi
+              else
+                if grep -Fq 'Policy Passed = false' "$RESULTS_DIR/results.txt"; then POLICY_FAILED=true; fi
+              fi
+            fi
+          fi
+
+          EXIT_CODE=0
+          if [ "$POLICY_FAILED" = true ]; then
+            echo "::error::Veracode Container Scanning failed"
+            EXIT_CODE=1
+          elif is_true "${FAIL_BUILD:-false}"; then
+            echo "Veracode Container Scanning passed"
+          fi
+          if [ "$SCAN_ERROR" = true ] && is_true "${FAIL_BUILD_ON_ERROR:-false}"; then
+            echo "Note: Build failed due to break_build_on_error flag being set to true."
+            EXIT_CODE=1
+          fi
+          exit "$EXIT_CODE"
+
+      - name: Store Veracode IaC/Secrets Scanning results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: Veracode Container IaC Secrets Scanning Results
+          path: ${{ runner.temp }}/veracode-iac-results/
+          if-no-files-found: ignore
+"""
+
+
+def _yaml_dq(value: str) -> str:
+    """YAML double-quoted scalar."""
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _yaml_scalar_value(raw: str) -> str:
+    raw = raw.strip()
+    if len(raw) >= 2 and raw[0] == raw[-1] == '"':
+        return raw[1:-1].replace('\\"', '"').replace("\\\\", "\\")
+    if len(raw) >= 2 and raw[0] == raw[-1] == "'":
+        return raw[1:-1].replace("''", "'")
+    return raw
+
+
+def normalize_teams_for_cli(teams_value: str) -> str:
+    """CLI --teams wants comma-separated names with no spaces around the commas."""
+    parts = [p.strip() for p in teams_value.replace("\r", "").replace("\n", "").split(",")]
+    return ",".join(p for p in parts if p)
+
+
+def _indent_of(line: str) -> int:
+    return len(line) - len(line.lstrip(" \t"))
+
+
+def _render_iac_block(teams_value: str, item_indent: int) -> str:
+    block = _IAC_RBAC_STEP_BLOCK.replace(
+        _IAC_TEAMS_PLACEHOLDER,
+        f"          VERACODE_TEAMS: {_yaml_dq(normalize_teams_for_cli(teams_value))}\n",
+        1,
+    )
+    delta = item_indent - _IAC_BLOCK_INDENT
+    if delta == 0:
+        return block
+    out: list[str] = []
+    for line in block.splitlines(keepends=True):
+        if not line.strip():
+            out.append(line)
+        elif delta > 0:
+            out.append(" " * delta + line)
+        else:
+            out.append(line[min(-delta, _indent_of(line)):])
+    return "".join(out)
+
+
+def _replace_iac_action_step(content: str, teams_value: str) -> tuple[str, bool]:
+    """Replace the veracode/container_iac_secrets_scanning step with the CLI block.
+
+    Returns (content, changed). Leaves the content untouched when the action
+    step is not found or the surrounding YAML is not shaped as expected.
+    """
+    lines = content.splitlines(keepends=True)
+    uses_idx = next((i for i, ln in enumerate(lines) if _IAC_ACTION_USES_RE.match(ln)), None)
+    if uses_idx is None:
+        return content, False
+
+    uses_line = lines[uses_idx]
+    item_m = _YAML_ITEM_RE.match(uses_line)
+    if item_m:
+        start, item_indent = uses_idx, len(item_m.group("indent"))
+    else:
+        key_indent = _indent_of(uses_line)
+        start = -1
+        item_indent = -1
+        for i in range(uses_idx - 1, -1, -1):
+            ln = lines[i]
+            if not ln.strip() or ln.lstrip().startswith("#"):
+                continue
+            m = _YAML_ITEM_RE.match(ln)
+            if m and len(m.group("indent")) < key_indent:
+                start, item_indent = i, len(m.group("indent"))
+                break
+            if _indent_of(ln) < key_indent:
+                return content, False
+        if start < 0:
+            return content, False
+
+    end = start + 1
+    last_content = start
+    while end < len(lines):
+        ln = lines[end]
+        if ln.strip():
+            if _indent_of(ln) <= item_indent:
+                break
+            last_content = end
+        end += 1
+    end = last_content + 1
+
+    rest = "".join(lines[end:])
+    before = "".join(lines[:start])
+    block = _render_iac_block(teams_value, item_indent)
+    # Keep a blank line between the block and whatever followed the old step.
+    sep = "\n" if rest and rest.split("\n", 1)[0].strip() else ""
+    return before + block + sep + rest, True
+
+
+def _update_iac_teams_value(content: str, teams_value: str, update_existing: bool) -> tuple[str, bool]:
+    desired = normalize_teams_for_cli(teams_value)
+    changed = False
+
+    def replacer(m: re.Match) -> str:
+        nonlocal changed
+        current = _yaml_scalar_value(m.group("value"))
+        if current == desired:
+            return m.group(0)
+        if current and not update_existing:
+            return m.group(0)
+        changed = True
+        return m.group("prefix") + _yaml_dq(desired)
+
+    return _IAC_TEAMS_LINE_RE.sub(replacer, content, count=1), changed
+
+
+def apply_iac_rbac(content: str, teams_value: str, update_existing: bool = True) -> tuple[str, bool, str]:
+    """Convert the IaC workflow to the CLI-with-RBAC step and/or set its teams.
+
+    Returns (content, changed, action) where action is one of:
+    converted, teams_updated, already_current, action_step_not_found.
+    """
+    if _IAC_RBAC_MARKER in content:
+        new_content, changed = _update_iac_teams_value(content, teams_value, update_existing)
+        return new_content, changed, "teams_updated" if changed else "already_current"
+    new_content, converted = _replace_iac_action_step(content, teams_value)
+    if converted:
+        return new_content, True, "converted"
+    return content, False, "action_step_not_found"
+
+
+def _apply_teams_to_workflow(
+    workflow_path: str, content: str, teams_value: str, update_existing: bool,
+) -> tuple[str, bool, str]:
+    """Return (new_content, changed, action) for one workflow file."""
+    if workflow_path == IAC_WORKFLOW_PATH:
+        return apply_iac_rbac(content, teams_value, update_existing)
+    new_content, was_injected = _inject_teams_regex(content, teams_value)
+    was_updated = False
+    if update_existing:
+        new_content, was_updated = _update_teams_value(new_content, teams_value)
+    changed = was_injected or was_updated
+    return new_content, changed, ("teams_updated" if changed else "already_current")
+
+
 def inject_teams_into_workflows(
     api_base: str, org: str, repo: str, token: str, teams_value: str,
     update_existing: bool = False,
     log: Callable[[str], None] = tprint,
+    include_iac_rbac: bool = False,
+    file_actions: dict[str, str] | None = None,
 ) -> tuple[bool, str]:
+    """Inject/update teams in the policy and sandbox scan workflows and, with
+    include_iac_rbac, convert the IaC/Secrets workflow to the Veracode CLI with
+    RBAC (--app-name/--create-app/--teams) and keep its teams in sync.
+
+    file_actions, when given, receives a per-file action for the report.
+    """
     workflow_files = [
         ".github/workflows/veracode-sandbox-scan.yml",
         ".github/workflows/veracode-policy-scan.yml",
     ]
+    if include_iac_rbac:
+        workflow_files.append(IAC_WORKFLOW_PATH)
     modified_count = 0
     files_checked = 0
 
+    def record(path: str, action: str) -> None:
+        if file_actions is not None:
+            file_actions[path.split("/")[-1]] = action
+
     for workflow_path in workflow_files:
+        file_name = workflow_path.split("/")[-1]
         url = f"{api_base}/repos/{org}/{repo}/contents/{workflow_path}"
         r = request("GET", url, token, params={"ref": "main"})
         if r.status_code != 200:
+            record(workflow_path, "not_found")
             continue
 
         files_checked += 1
@@ -1761,21 +2152,27 @@ def inject_teams_into_workflows(
         raw_content = b64decode(file_data.get("content", "")).decode("utf-8")
 
         try:
-            new_content, was_injected = _inject_teams_regex(raw_content, teams_value)
-
-            was_updated = False
-            if update_existing:
-                new_content, was_updated = _update_teams_value(new_content, teams_value)
-
-            if not was_injected and not was_updated:
+            new_content, changed, action = _apply_teams_to_workflow(
+                workflow_path, raw_content, teams_value, update_existing,
+            )
+            if not changed:
+                if action == "action_step_not_found":
+                    log(f"  [{org}] {file_name}: veracode/container_iac_secrets_scanning step not found - "
+                        f"IaC RBAC not applied, manual review needed.")
+                record(workflow_path, action)
                 continue
 
         except Exception as exc:
             log(f"  [{org}] Regex injection error for {workflow_path}: {exc}")
+            record(workflow_path, f"error:{exc}")
             continue
 
+        if action == "converted":
+            message = f"Convert {file_name} to Veracode CLI with RBAC (app profile and teams)"
+        else:
+            message = f"Update teams parameter in {file_name}"
         payload = {
-            "message": f"Update teams parameter in {workflow_path.split('/')[-1]}",
+            "message": message,
             "content": b64encode(new_content.encode("utf-8")).decode("utf-8"),
             "sha": sha,
             "branch": "main",
@@ -1789,22 +2186,29 @@ def inject_teams_into_workflows(
             if r_refetch.status_code == 200:
                 fresh_sha = r_refetch.json().get("sha")
                 fresh_content = b64decode(r_refetch.json().get("content", "")).decode("utf-8")
-                fresh_new, _ = _inject_teams_regex(fresh_content, teams_value)
-                if update_existing:
-                    fresh_new, _ = _update_teams_value(fresh_new, teams_value)
+                fresh_new, _, _ = _apply_teams_to_workflow(
+                    workflow_path, fresh_content, teams_value, update_existing,
+                )
                 payload["sha"] = fresh_sha
                 payload["content"] = b64encode(fresh_new.encode("utf-8")).decode("utf-8")
                 r = request("PUT", url, token, json=payload)
 
         if r.status_code in (200, 201):
             modified_count += 1
+            record(workflow_path, action)
+            if action == "converted":
+                log(f"  [{org}] {file_name}: converted to Veracode CLI with RBAC "
+                    f"(teams: {normalize_teams_for_cli(teams_value) or 'none'})")
         elif r.status_code == 409:
+            record(workflow_path, "failed:409")
             log(f"  [{org}] {workflow_path} on main: 409 conflict after retry. "
                 f"Likely a branch protection rule requires PRs - manual fix needed.")
         elif r.status_code == 422 and "protected branch" in r.text.lower():
+            record(workflow_path, "failed:protected_branch")
             log(f"  [{org}] {workflow_path} on main: protected branch - direct push rejected. "
                 f"Manual fix or PR required.")
         else:
+            record(workflow_path, f"failed:{r.status_code}")
             log(f"  [{org}] Failed to update {workflow_path} on main: {r.status_code} {r.text[:200]}")
 
     if modified_count > 0:
@@ -2636,6 +3040,7 @@ def process_org(
                 web_base=ctx.web_base,
                 cached_clone_dir=cached_clone_dir,
                 log=buf.add,
+                include_iac_rbac=ctx.do_iac_rbac,
             )
             entry["fix_repos"] = {
                 "repo_exists": health.repo_exists,
@@ -2758,12 +3163,16 @@ def process_org(
                 repo_exists(ctx.api_base, org, INTEGRATION_REPO_NAME, ctx.token) and
                 not repo_is_empty(ctx.api_base, org, INTEGRATION_REPO_NAME, ctx.token)
             ):
+                file_actions: dict[str, str] = {}
                 teams_ok, teams_msg = inject_teams_into_workflows(
                     ctx.api_base, org, INTEGRATION_REPO_NAME, ctx.token, teams_value,
                     update_existing=True,
                     log=buf.add,
+                    include_iac_rbac=ctx.do_iac_rbac,
+                    file_actions=file_actions,
                 )
-                entry["teams_injection"] = {"success": teams_ok, "action": teams_msg, "value": teams_value}
+                entry["teams_injection"] = {"success": teams_ok, "action": teams_msg, "value": teams_value,
+                                            "files": file_actions}
                 with ctx.stats_lock:
                     if teams_ok:
                         if "updated" in teams_msg:
@@ -3076,6 +3485,13 @@ def main() -> None:
                     help="[apply] Create teams on the Veracode platform (Identity API) if they "
                          "do not already exist. Requires VERACODE_API_ID and VERACODE_API_KEY.")
 
+    ap.add_argument("--skip-iac-rbac", action="store_true",
+                    help="[apply] Do not touch the IaC/Secrets workflow. By default, --set-teams-* "
+                         "(and --fix-repos with a teams mode) replace the "
+                         "veracode/container_iac_secrets_scanning step with a Veracode CLI step "
+                         "(CLI 2.55.0+) that links results to the application profile with "
+                         "--app-name, --create-app and --teams, and keep its teams in sync.")
+
     ap.add_argument("--link-teams-to-workspaces", action="store_true",
                     help="[apply] Associate each org's team with its SCA workspace so the team "
                          "can see scan results. Resolves workspace by org name and team by teams "
@@ -3253,6 +3669,8 @@ def main() -> None:
             print("    - Add/update veracode.yml if missing")
             if teams_mode != "none":
                 print("    - Inject/update teams in workflow files")
+                if not args.skip_iac_rbac:
+                    print("    - Convert IaC/Secrets workflow to Veracode CLI with RBAC")
         else:
             print(f"  Import missing repos  : {'YES' if do_apply_repo else 'NO (--import-repo)'}")
             if do_apply_repo:
@@ -3267,6 +3685,7 @@ def main() -> None:
                 print(f"  Set teams in workflows: YES (from {args.set_teams_file})")
             if args.team_prefix:
                 print(f"    Team prefix         : '{args.team_prefix}'")
+            print(f"    IaC/Secrets RBAC    : {'NO (--skip-iac-rbac)' if args.skip_iac_rbac else 'YES (Veracode CLI --app-name --create-app --teams)'}")
         if do_create_teams:
             print("  Create platform teams : YES (via Veracode Identity API)")
         if do_link_teams:
@@ -3434,6 +3853,7 @@ def main() -> None:
         total_orgs=total_orgs,
         report_path=report_path,
         checkpoint_file=checkpoint_file,
+        do_iac_rbac=not args.skip_iac_rbac,
         stats=RunStats(total_orgs=total_orgs),
     )
 
