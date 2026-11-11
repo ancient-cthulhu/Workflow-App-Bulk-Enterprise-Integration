@@ -127,7 +127,7 @@ Swap `--set-teams-auto` for `--set-teams-file out/teams_map.csv` or `--set-teams
 | --- | --- | --- |
 | `--apply` | Turns on changes. Without it every run is a dry run. | Nothing is changed. |
 | `--orgs-file orgs.txt` | Limits the run to the orgs in your file. | The script falls back to every org your token can see. |
-| `--import-repo` | Creates the private `veracode` repo in each org, imports the Veracode workflow templates, sets `main` as default branch, adds the onboarding `veracode.yml` (build gating off). | No workflows exist, so nothing scans. |
+| `--import-repo` | Creates the private `veracode` repo in each org, imports the Veracode workflow templates, sets `main` as default branch, adds the onboarding `veracode.yml` (static-scan gating off; IaC policy findings and SCA errors still break builds). | No workflows exist, so nothing scans. |
 | `--set-teams-auto` / `-file` / `-hybrid` | Adds `teams:` to the policy and sandbox scan workflows, and switches the IaC/Secrets workflow to the Veracode CLI with `--app-name`, `--create-app` and `--teams` (RBAC). Add `--skip-iac-rbac` to leave the IaC workflow unchanged. | Scan results are not assigned to any team; IaC/Secrets results are visible only to Security Leads. |
 | `--team-prefix PREFIX` | Optional prefix on every team name. | Teams are named exactly as the org or CSV value. |
 | `--create-teams` | Creates each team on the Veracode platform if it does not exist yet. | Workflows point at teams that do not exist on the platform. |
