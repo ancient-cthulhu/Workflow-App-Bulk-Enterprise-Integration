@@ -192,42 +192,15 @@ Grants the team visibility into the org's agent-based SCA workspace results. Thi
 
 ### IaC/Secrets RBAC
 
-The upstream `veracode-iac-secrets-scan.yml` uses `veracode/container_iac_secrets_scanning`, which cannot link results to an application profile. Without that link, IaC and container results are visible only to Security Leads.
-
-With a `--set-teams-*` flag (and without `--skip-iac-rbac`), the script replaces that step in each org's `veracode` repo with a Veracode CLI step:
+With a `--set-teams-*` flag, the script replaces the `veracode/container_iac_secrets_scanning` step in `veracode-iac-secrets-scan.yml` with a Veracode CLI step, so IaC/secrets results are linked to the app profile and its teams instead of being visible only to Security Leads:
 
 ```bash
-veracode scan --source ./ --type directory ... \
-  --app-name "<profile name>" --create-app --teams "<teams>"
+veracode scan ... --app-name "<profile_name, default org/repo>" --create-app --teams "<resolved teams>"
 ```
 
-|Option|Value|
-|---|---|
-|`--app-name`|The profile the static and SCA scans use (`profile_name`, default `<org>/<repo>`).|
-|`--create-app`|Creates the profile on the first scan. If the profile exists, links the results to it.|
-|`--teams`|Resolved team value with spaces around commas removed. Stored in the step as `VERACODE_TEAMS: "<teams>"` and updated on every apply.|
-
-**Kept from the action:**
-- The latest CLI is installed from `tools.veracode.com` on every run, so runners need access to it.
-- The IaC policy is applied.
-- `break_build_policy_findings` and `break_build_on_error` are honored.
-- `results.json`, `results.txt` and the SBOMs are uploaded as the `Veracode Container IaC Secrets Scanning Results` artifact. Upload errors never fail the job.
-
-**Requires Veracode CLI 2.55.0+.** The step fails with an explicit error on older versions.
-
-**Idempotent:**
-- Converted files carry a `# veracode-iac-rbac` marker; later runs only update `VERACODE_TEAMS`.
-- If the action step is not found (customized workflow), the file is left unchanged and the log says so.
-- A `--fix-repos` re-import restores the action, and the same run converts it again.
-
-**Veracode prerequisites** (from Veracode's *Role-based access control for container and IaC Security* doc):
-- The teams exist (`--create-teams`).
-- The service account behind the org's `VERACODE_API_ID` secret:
-  - has the Upload and Scan API or Upload API - Submit Only role and the `createApplicationProfile` permission;
-  - is a member of the teams it assigns.
-- Results appear under **Container & IaC Analysis**, not in the application profile view.
-
-> **Pilot first:** convert one org with `--orgs-file`, run the IaC scan, and confirm that the team sees the findings before rolling out.
+- Policy, build-break settings and the results artifact behave as before. The step needs CLI 2.55.0+, installed from `tools.veracode.com` on each run.
+- Re-runs only update `VERACODE_TEAMS` in the step. Use `--skip-iac-rbac` to leave the workflow untouched.
+- The org's service account must be a member of the teams it assigns. Results appear under **Container & IaC Analysis**.
 
 -----
 
