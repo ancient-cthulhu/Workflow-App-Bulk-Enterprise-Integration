@@ -366,9 +366,9 @@ veracode scan --source ./ --type directory ... \
 
 - `--app-name` is the same application profile the static and SCA scans use (`profile_name`, default `<org>/<repo>`), so IaC findings are linked to the same profile.
 - `--teams` is the resolved teams value (after `--team-prefix`), with spaces around commas removed as the CLI requires. It is stored in the step as `VERACODE_TEAMS: "<teams>"` and kept in sync on re-runs.
-- `--create-app` creates the profile on the first scan if it does not exist yet.
+- `--create-app` creates the profile on the first scan if it does not exist yet. When the profile already exists (for example, created by the static scan), it does nothing and the results are linked to that profile.
 
-Everything else matches the action: the latest CLI is installed from `tools.veracode.com` on every run, the IaC policy is downloaded and applied, `break_build_policy_findings` and `break_build_on_error` are honored, and `results.json`, `results.txt` and the SBOM files are uploaded as the `Veracode Container IaC Secrets Scanning Results` artifact. The step stops with a clear error if the installed CLI is older than 2.55.0, the first version with RBAC for container and IaC scans.
+Everything else matches the action: the latest CLI is installed from `tools.veracode.com` on every run, the IaC policy is downloaded and applied, `break_build_policy_findings` and `break_build_on_error` are honored, and `results.json`, `results.txt` and the SBOM files are uploaded as the `Veracode Container IaC Secrets Scanning Results` artifact (upload errors never fail the job, as with the action). The step stops with a clear error if the installed CLI is older than 2.55.0, the first version with RBAC for container and IaC scans.
 
 The conversion is idempotent. The script recognizes converted files by the `# veracode-iac-rbac` marker and then only updates `VERACODE_TEAMS`. If the action step is not found (for example, a customized workflow), the file is left unchanged and the run log says so. A re-import from upstream (`--fix-repos`) restores the action; the same run converts it again.
 

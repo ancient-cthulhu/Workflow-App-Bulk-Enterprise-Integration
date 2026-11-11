@@ -1899,10 +1899,11 @@ _IAC_RBAC_STEP_BLOCK = r"""      # veracode-iac-rbac (managed by Workflow-App-Bu
           fi
 
           # Exit code 3 = scan completed but did not pass policy. Anything else non-zero is an error.
+          # --create-app creates the profile on the first scan and links to it when it already exists.
           run_scan() {
             local label="$1"; shift
-            echo "Running: veracode $*"
-            "$CLI" "$@"
+            echo "Running: veracode $* ${rbac_args[*]-}"
+            "$CLI" "$@" ${rbac_args[@]+"${rbac_args[@]}"}
             local rc=$?
             debug "$label exit code: $rc"
             if [ "$rc" -eq 3 ]; then
@@ -1921,8 +1922,8 @@ _IAC_RBAC_STEP_BLOCK = r"""      # veracode-iac-rbac (managed by Workflow-App-Bu
           }
 
           # --- Scans --------------------------------------------------------------------
-          run_scan "json" scan --source ./ --type directory --format json --output "$RESULTS_DIR/results.json" --temp "$CACHE_DIR" ${policy_args[@]+"${policy_args[@]}"} ${rbac_args[@]+"${rbac_args[@]}"}
-          run_scan "table" scan --source ./ --type directory --format table --output "$RESULTS_DIR/results.txt" --temp "$CACHE_DIR" ${policy_args[@]+"${policy_args[@]}"} ${rbac_args[@]+"${rbac_args[@]}"}
+          run_scan "json" scan --source ./ --type directory --format json --output "$RESULTS_DIR/results.json" --temp "$CACHE_DIR" ${policy_args[@]+"${policy_args[@]}"}
+          run_scan "table" scan --source ./ --type directory --format table --output "$RESULTS_DIR/results.txt" --temp "$CACHE_DIR" ${policy_args[@]+"${policy_args[@]}"}
 
           for sbom in "cyclonedx-xml:sbom_cyclonedx_xml.xml" "cyclonedx-json:sbom_cyclonedx_json.json" "spdx-tag-value:sbom_spdx_tag_value.json" "spdx-json:sbom_spdx_json.json" "github:sbom_github.json"; do
             run_cli sbom --source ./ --type directory --format "${sbom%%:*}" --output "$RESULTS_DIR/${sbom#*:}"
@@ -1961,8 +1962,10 @@ _IAC_RBAC_STEP_BLOCK = r"""      # veracode-iac-rbac (managed by Workflow-App-Bu
           fi
           exit "$EXIT_CODE"
 
+      # Upload problems never fail the job (same as the action, which ignored upload errors).
       - name: Store Veracode IaC/Secrets Scanning results
         if: ${{ !cancelled() }}
+        continue-on-error: true
         uses: actions/upload-artifact@v7
         with:
           name: Veracode Container IaC Secrets Scanning Results
@@ -3816,6 +3819,8 @@ def main() -> None:
             print("  - Link teams to SCA workspaces on Veracode platform")
         if do_set_teams:
             print("  - Inject/update teams parameters into workflows")
+            if not args.skip_iac_rbac:
+                print("  - Convert IaC/Secrets workflow to Veracode CLI with RBAC (--app-name --create-app --teams)")
         if do_update_yml:
             print(f"  - Push veracode.yml from {yml_source_label}")
         if do_set_secrets:
