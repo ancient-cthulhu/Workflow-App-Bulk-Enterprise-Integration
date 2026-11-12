@@ -1287,9 +1287,8 @@ def add_team_to_workspace(
 
     Returns (success, action): 'linked' | 'already_linked' | 'error'.
 
-    NOTE: confirm the endpoint path against the SCA Agent API spec for your
-    tenant. The path below follows the existing /srcclr/v3/workspaces/{id}/...
-    convention used elsewhere in this script.
+    PUT /srcclr/v3/workspaces/{id}/teams/{teamId} (SCA Agent API spec, addTeam).
+    team_id must be the SCA team id, not the Identity API team_id.
     """
     try:
         r = veracode_request(
@@ -1309,6 +1308,72 @@ def add_team_to_workspace(
         return False, "error"
 
 
+def _sca_embedded_items(body: Any, key: str) -> list[dict[str, Any]]:
+    """Items of a HAL list response (`_embedded.<key>`), tolerant of key naming."""
+    embedded = body.get("_embedded", {}) if isinstance(body, dict) else {}
+    items = embedded.get(key)
+    if items is None:
+        items = next((v for v in embedded.values() if isinstance(v, list)), [])
+    return [i for i in items if isinstance(i, dict)]
+
+
+def _find_sca_team_id(
+    team_name: str,
+    api_id: str,
+    api_key: str,
+    log: Callable[[str], None] = tprint,
+    attempts: int = 1,
+    wait_seconds: int = 10,
+) -> str | None:
+    """Resolve the SCA Agent API team id (GET /srcclr/v3/teams?name=...).
+
+    The SCA API uses its own team ids, not the Identity API team_id (UUID), so
+    linking must use this id. A team created moments ago may take a short
+    time to appear here, hence the optional retries.
+    """
+    for attempt in range(1, attempts + 1):
+        page = 0
+        while True:
+            r = veracode_request(
+                "GET", "/srcclr/v3/teams", api_id, api_key,
+                params={"name": team_name, "size": 100, "page": page},
+            )
+            if r.status_code in (401, 403):
+                log(f"  [ERROR] SCA teams lookup denied ({r.status_code}) - check Veracode credentials/roles")
+                return None
+            if r.status_code != 200:
+                log(f"  [ERROR] SCA teams lookup failed: {r.status_code} - {r.text[:200]}")
+                return None
+            body = r.json()
+            for team in _sca_embedded_items(body, "teams"):
+                if team.get("name") == team_name and team.get("id") not in (None, ""):
+                    return str(team["id"])
+            page_meta = body.get("page", {}) if isinstance(body, dict) else {}
+            if page >= page_meta.get("total_pages", 1) - 1:
+                break
+            page += 1
+        if attempt < attempts:
+            log(f"  [INFO] Team '{team_name}' not visible in SCA yet - retrying in {wait_seconds}s "
+                f"({attempt}/{attempts - 1})")
+            time.sleep(wait_seconds)
+    return None
+
+
+def _workspace_has_team(
+    workspace_id: str,
+    sca_team_id: str,
+    api_id: str,
+    api_key: str,
+    log: Callable[[str], None] = tprint,
+) -> bool | None:
+    """True/False if the workspace already has the team; None if unknown."""
+    r = veracode_request("GET", f"/srcclr/v3/workspaces/{workspace_id}/teams", api_id, api_key)
+    if r.status_code != 200:
+        log(f"  [WARNING] Could not read teams of workspace {workspace_id}: {r.status_code}")
+        return None
+    return any(str(t.get("id")) == sca_team_id for t in _sca_embedded_items(r.json(), "teams"))
+
+
 def ensure_team_linked_to_workspace(
     org_name: str,
     team_name: str,
@@ -1317,24 +1382,34 @@ def ensure_team_linked_to_workspace(
     workspace_id: str | None = None,
     team_id: str | None = None,
     log: Callable[[str], None] = tprint,
+    wait_for_team: bool = False,
 ) -> tuple[bool, str]:
     """
     Link `team_name` to the SCA workspace named `org_name`. Resolves the
-    workspace and team IDs by name if they were not already captured this run,
-    so this works as a standalone pass against pre-existing workspaces/teams.
-    Creates neither the workspace nor the team.
+    workspace id by name if it was not captured this run. Creates neither the
+    workspace nor the team.
 
-    Returns (success, action), adding 'workspace_not_found' | 'team_not_found'
-    to the set returned by add_team_to_workspace.
+    team_id, if given, must be an SCA Agent API team id. Identity API team ids
+    (UUIDs from /api/authn/v2/teams) are rejected by the SCA API with 404, so
+    by default the SCA id is resolved by name. wait_for_team retries that
+    lookup for a team created moments ago.
+
+    Returns (success, action): 'linked' | 'already_linked' | 'error' |
+    'workspace_not_found' | 'team_not_found'.
     """
     if not workspace_id:
         workspace_id = _find_workspace_by_name(org_name, api_id, api_key, log)
         if not workspace_id:
             return False, "workspace_not_found"
     if not team_id:
-        team_id = _find_veracode_team_by_name(team_name, api_id, api_key, log)
+        team_id = _find_sca_team_id(
+            team_name, api_id, api_key, log,
+            attempts=4 if wait_for_team else 1,
+        )
         if not team_id:
             return False, "team_not_found"
+    if _workspace_has_team(workspace_id, team_id, api_id, api_key, log):
+        return True, "already_linked"
     return add_team_to_workspace(workspace_id, team_id, api_id, api_key, log)
 
 
@@ -3337,8 +3412,10 @@ def process_org(
                 api_id=ctx.veracode_api_id,
                 api_key=ctx.veracode_api_key,
                 workspace_id=captured_workspace_id,
-                team_id=captured_team_id,
+                # captured_team_id is an Identity API id; the SCA API needs its own,
+                # resolved by name. Wait for it when the team was handled this run.
                 log=buf.add,
+                wait_for_team=captured_team_id is not None,
             )
             entry["veracode_team_workspace_link"] = {
                 "workspace": org,
