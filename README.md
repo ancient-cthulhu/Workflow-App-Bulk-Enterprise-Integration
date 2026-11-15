@@ -14,6 +14,7 @@ Step-by-step guides: [enterprise onboarding](onboarding-guide/enterprise-onboard
 |---|---|
 |Python 3.9+|Always|
 |`pip install requests`|Always|
+|`pip install PyYAML`|Always (edited workflows and `veracode.yml` are parsed before they are written)|
 |`pip install veracode-api-signing`|`--create-teams`, `--set-secrets`, `--link-teams-to-workspaces`|
 |`pip install pynacl`|`--set-secrets` (checked at startup)|
 |`git` on `PATH`|`--import-repo`, and `--fix-repos` when it re-imports a broken repo|
@@ -22,7 +23,8 @@ Step-by-step guides: [enterprise onboarding](onboarding-guide/enterprise-onboard
 |Veracode Administrator account|Veracode API flags (see [Credentials](#credentials))|
 
 ```bash
-pip install requests veracode-api-signing pynacl
+pip install requests PyYAML veracode-api-signing pynacl
+# or: pip install -r requirements.txt
 ```
 
 -----
@@ -107,6 +109,8 @@ Use a **classic personal access token**. The token's user must be an **owner** o
 
 If orgs enforce SAML SSO, authorize the token for each one (`Settings > Developer settings > Personal access tokens > Configure SSO`). Unauthorized orgs are hidden from discovery and reported in the [completeness check](#discovery).
 
+At startup the script validates credentials before touching any org: the GitHub token (and warns about any scope above that the chosen flags need but the classic PAT lacks), `VERACODE_API_ID`/`KEY`, `VERACODE_SA_API_ID`/`KEY` with `--set-secrets` (invalid ones abort the run instead of being written into every org), and, with `--create-teams`, that the Veracode account can list teams (Administrator role).
+
 -----
 
 ## Command-Line Reference
@@ -116,7 +120,7 @@ If orgs enforce SAML SSO, authorize the token for each one (`Settings > Develope
 |Flag|Behavior|
 |---|---|
 |`--dry-run` *(default)*|Read-only. Reports state and writes the output files.|
-|`--apply`|Makes changes for the action flags given. Asks for `yes` unless `--continue` is set.|
+|`--apply`|Makes changes for the action flags given. Asks for `yes` unless `--yes` is set or `--continue` resumes from a matching checkpoint.|
 
 ### Action flags (need `--apply`, except `--fix-repos`)
 
@@ -129,9 +133,10 @@ If orgs enforce SAML SSO, authorize the token for each one (`Settings > Develope
 |`--team-prefix PREFIX`|Prepend `PREFIX` to every resolved team (`gh-` + `acme-dev` = `gh-acme-dev`). Orgs without a team are not affected.|
 |`--skip-iac-rbac`|Leave the IaC/Secrets workflow unchanged. See [IaC/Secrets RBAC](#iacsecrets-rbac).|
 |`--create-teams`|Create the resolved team on the Veracode platform. **Ignored without a `--set-teams-*` flag.**|
-|`--set-secrets`|Set the three org secrets. Always overwrites them and regenerates the SCA agent token (`token:regenerate`), which invalidates the old one.|
+|`--set-secrets`|Set the three org secrets. Always overwrites them and regenerates the SCA agent token (`token:regenerate`), which invalidates the old one. The org's Actions public key is fetched first; if that fails the token is **not** rotated and the org is reported as an error.|
 |`--link-teams-to-workspaces`|Add the resolved team to the org's SCA workspace. **Rejected at startup without a `--set-teams-*` flag.**|
-|`--update-veracode-yml [FILE]`|Push `veracode.yml` to every org, after backing up the current one as `default-veracode.yml`. Without `FILE`, fetches it from `raw.githubusercontent.com` (upstream integration repo).|
+|`--update-veracode-yml [FILE]`|Push `veracode.yml` to every org, after backing up the current one as `default-veracode.yml`. Without `FILE`, fetches it from `raw.githubusercontent.com` (upstream integration repo) at `--upstream-ref`.|
+|`--upstream-ref REF`|Upstream tag/branch for `--update-veracode-yml` without `FILE`. Default: latest release tag; `main` allowed.|
 |`--fix-repos`|Audit (dry run) or repair (apply) already-imported repos. See [Fix Existing Repos](#fix-existing-repos).|
 
 ### Configuration flags
@@ -145,8 +150,10 @@ If orgs enforce SAML SSO, authorize the token for each one (`Settings > Develope
 |`--token-env NAME`|`GITHUB_TOKEN`|Environment variable that holds the PAT.|
 |`--out DIR`|`out`|Output directory.|
 |`--skip-to ORG`|-|Start at this org. Warns and processes all orgs if not found.|
-|`--continue`|-|Resume from `out/checkpoint.json` and skip the confirmation prompt.|
+|`--continue`|-|Resume from `out/checkpoint.json` written by a run with the same mode and action flags: skip completed orgs, retry failed ones, skip the confirmation prompt. See [Checkpoint and resume](#large-deployments).|
+|`--yes`|-|Skip the `--apply` confirmation prompt (unattended runs).|
 |`--workers N`|`1`|Parallel orgs. Must be >= 1; above 10 prints a warning. See [Large Deployments](#large-deployments).|
+|`--secret-visibility {selected,private,all}`|`selected`|Which repos can read the secrets set by `--set-secrets`. `selected`: only the org's `veracode` repo (falls back to `private`, with a warning, if its id can't be read). `private`: private and internal repos. `all`: every repo, including public ones.|
 
 **Mutually exclusive:**
 - `--dry-run` and `--apply`
@@ -199,7 +206,9 @@ veracode scan ... --app-name "<profile_name, default org/repo>" --create-app --t
 ```
 
 - Policy, build-break settings and the results artifact behave as before. The step needs CLI 2.55.0+, installed from `tools.veracode.com` on each run.
-- Re-runs only update `VERACODE_TEAMS` in the step. Use `--skip-iac-rbac` to leave the workflow untouched.
+- Re-runs only update `VERACODE_TEAMS` in the step (a trailing `# comment` on that line is kept). Use `--skip-iac-rbac` to leave the workflow untouched.
+- The step is named `Run Veracode IaC/Secrets Scanning (team RBAC)` (id `veracode_iac_scan`, marker comment `# veracode-iac-rbac`) so Workflow-App-Upstream-Sync sees it as a customised step rather than upstream's. Files converted by older versions (step without the suffix) are recognised as already converted.
+- The file's line endings (LF or CRLF) are preserved.
 - The org's service account must be a member of the teams it assigns. Results appear under **Container & IaC Analysis**.
 
 -----
@@ -219,12 +228,18 @@ veracode scan ... --app-name "<profile_name, default org/repo>" --create-app --t
 To change the configuration across all orgs later (policy, triggers, enable static gating):
 
 ```bash
-# Upstream veracode.yml (from raw.githubusercontent.com)
+# Upstream veracode.yml from the latest release tag (from raw.githubusercontent.com)
 python script.py --apply --enterprise YOUR-ENTERPRISE --update-veracode-yml
+
+# Upstream veracode.yml from a specific tag, or from the unreleased main branch
+python script.py --apply --enterprise YOUR-ENTERPRISE --update-veracode-yml --upstream-ref v1.2.3
+python script.py --apply --enterprise YOUR-ENTERPRISE --update-veracode-yml --upstream-ref main
 
 # Custom file
 python script.py --apply --enterprise YOUR-ENTERPRISE --update-veracode-yml /path/to/veracode.yml
 ```
+
+Without `FILE`, the file is fetched from the latest release of `veracode/github-actions-integration` (`GET /repos/veracode/github-actions-integration/releases/latest`), not from `main`, so an unreleased upstream change is never pushed to every org by accident. If the release cannot be looked up, the run stops; pass `--upstream-ref`. `--import-repo` still mirrors the whole upstream repository (its `main` is upstream's `main`); `--upstream-ref` does not pin the import.
 
 The current file is kept as `default-veracode.yml`. Orgs without an imported repo are skipped and counted in the summary.
 
@@ -239,7 +254,7 @@ The current file is kept as `default-veracode.yml`. Orgs without an imported rep
 |Default branch|Sets `main`.|
 |`veracode.yml`|Adds it if missing (from `--update-veracode-yml` if given, otherwise the local `veracode.yml`). With `--update-veracode-yml`, also replaces an existing file (backup in `default-veracode.yml`).|
 |Teams (with a `--set-teams-*` flag)|Injects/updates `teams:` and converts the IaC workflow (unless `--skip-iac-rbac`).|
-|Broken import (no `main`, or both policy and sandbox workflows missing)|Re-imports from upstream (needs `git`), then runs the checks above.|
+|Broken import (no `main`, or both policy and sandbox workflows return `404` on `main`)|Re-imports from upstream (needs `git`) by pushing upstream `main` only, without force, then runs the checks above. Other branches and tags are never touched. If the existing `main` has diverged the push is rejected and reported as `failed:Push rejected ...`; nothing is overwritten. Any other status (`403`, `5xx`) is reported as `unknown:workflow_check_<status>` and no re-import is attempted.|
 
 ```bash
 python script.py --dry-run --fix-repos --enterprise YOUR-ENTERPRISE    # audit
@@ -280,7 +295,9 @@ On every run the script reads `/orgs/{org}/actions/permissions` and warns (never
 |---|---|
 |`all`|OK|
 |`local_only`|Flagged: Veracode actions are blocked.|
-|`selected`|Each required pattern is checked against `patterns_allowed`. `actions/*` passes when `github_owned_allowed` is true.|
+|`selected`|Each required action is matched against `patterns_allowed` the way GitHub does: case-insensitive, with `owner/*`, `owner/repo`, `owner/repo@*` and `owner/repo@ref` entries all accepted. `actions/*` passes when `github_owned_allowed` is true.|
+|Actions disabled (`enabled_repositories: none`)|Flagged as `actions_disabled`.|
+|Actions enabled for selected repos only|Flagged as `repo_not_enabled` unless the `veracode` repo is in `/orgs/{org}/actions/permissions/repositories`.|
 
 Flagged orgs go to `actions_allowlist_issues.csv`. Without `admin:org` the status is `no_permission`. Fix in `Settings > Actions > General`.
 
@@ -297,9 +314,21 @@ python script.py --apply --enterprise YOUR-ENTERPRISE \
 ```
 
 **Checkpoint and resume:**
-- `out/checkpoint.json` is written after each org.
-- `--continue` skips completed orgs (including from parallel runs) and restarts an interrupted org from the beginning.
+- `out/checkpoint.json` is written atomically (temp file + rename) after each org. It records the mode (`apply`/`dry-run`), the action flags, the orgs that `completed` and the orgs that `failed` (any step errored or failed, or the org raised).
+- `--continue` skips completed orgs (including from parallel runs), retries failed orgs, and restarts an interrupted org from the beginning. Progress from every earlier resumed run is kept.
+- A checkpoint is only used when it was written with the same mode and action flags. A dry-run checkpoint never marks orgs as done for `--apply` (and vice versa); a mismatching checkpoint is ignored with a message and the run starts from the beginning.
+- `--continue` skips the confirmation prompt only when it actually resumes from a matching checkpoint. Use `--yes` for unattended runs.
 - `--skip-to ORG` starts at an org without a checkpoint.
+
+**Exit codes:**
+
+|Code|Meaning|
+|---|---|
+|`0`|Every org processed without a failed step.|
+|`1`|Usage, configuration or credential error (nothing processed).|
+|`2`|Org discovery failed.|
+|`3`|At least one step failed (failure counters in the summary, e.g. teams/veracode.yml/secrets/team creation/link/default branch/re-import, or `--import-repo` could not import a repo) or an org raised an unexpected error. The report and CSVs are still written; `--continue` retries the failed orgs.|
+|`130`|Interrupted (Ctrl+C). The report is finalized and the checkpoint kept; re-run with `--continue`.|
 
 **Workers:**
 
@@ -327,7 +356,7 @@ Veracode calls (`api.veracode.com`) do not count against the GitHub budget. With
 
 ## Output Files
 
-All files are written to `--out` (default `out/`).
+All files are written to `--out` (default `out/`). In the CSV files, any cell that starts with `=`, `+`, `-`, `@`, a tab or a carriage return is prefixed with `'` so spreadsheet apps show it as text instead of running it as a formula.
 
 |File|Content|
 |---|---|
@@ -365,13 +394,13 @@ The audit report is written as JSON Lines during the run (crash-safe) and conver
 |`veracode_repo.status`|`repo_exists`, `repo_exists_post_import_incomplete` (self-healed this run), `repo_created_and_imported`, `repo_created_import_incomplete` (`main` not visible yet), `repo_created_manual_import_required`, `missing`|
 |`veracode_repo.default_branch_action`|`already_main`, `set_to_main`, `branch_not_found`, `failed`|
 |`teams_injection.action`|`teams_updated_<N>_files`, `teams_already_current`, `no_workflow_files_found`, `repo_not_ready`, `error:<msg>`|
-|`teams_injection.files.<file>`|`converted` (IaC only), `teams_updated`, `already_current`, `action_step_not_found`, `not_found`, `failed:<status>`, `error:<msg>`|
+|`teams_injection.files.<file>`|`converted` (IaC only), `teams_updated`, `already_current`, `action_step_not_found`, `uploadandscan_step_not_found`, `unrecognized_teams_value` (existing `teams:` is not a string or list; left alone), `invalid_yaml` (the edit would not parse or would change other keys; nothing written), `not_found`, `failed:<status>`, `error:<msg>`|
 |`veracode_team_platform.action`|`created`, `already_exists`, `error`|
 |`veracode_team_workspace_link.action`|`linked`, `already_linked`, `workspace_not_found`, `team_not_found`, `error`|
-|`veracode_yml_update.action`|`updated_with_backup`, `created`, `repo_not_found`, `repo_empty`, `put_failed:<status>`|
-|`actions_allowlist.status`|`all_allowed`, `selected_ok`, `local_only`, `selected_missing`, `no_permission`, `error`|
+|`veracode_yml_update.action`|`updated_with_backup` (customer original kept in `default-veracode.yml`, written only if it does not exist yet), `already_current` (no write), `created`, `repo_not_found`, `repo_empty`, `backup_failed:<status>` (backup could not be written; `veracode.yml` left unchanged), `invalid_yaml` (template is not a YAML mapping; nothing written), `put_failed:<status>`|
+|`actions_allowlist.status`|`all_allowed`, `selected_ok`, `local_only`, `selected_missing`, `actions_disabled`, `repo_not_enabled`, `no_permission`, `error`|
 |`secrets.status` (dry run)|`all_exist`, `all_missing`, `partial`, `no_permission`|
-|`fix_repos.reimport_action`|`not_needed`, `would_reimport`, `reimported`, `git_not_available`, `reimport_main_not_visible`, `failed:<msg>`|
+|`fix_repos.reimport_action`|`not_needed`, `would_reimport`, `reimported`, `git_not_available`, `reimport_main_not_visible`, `unknown:workflow_check_<status>`, `failed:<msg>`|
 
 -----
 
@@ -406,6 +435,8 @@ python script.py --apply --enterprise your-enterprise-slug \
 |`workspace_not_found`|Run `--set-secrets` first, or create the workspace (named after the org).|
 |`409 conflict after retry` / `protected branch`|A branch protection rule on `veracode/main` blocks direct pushes. Apply the change through a PR or relax the rule.|
 |`action_step_not_found` for the IaC workflow|The workflow was customized. Convert it manually or re-import with `--fix-repos`.|
+|`reimport_action` is `failed:Push rejected ...`|`veracode/main` has diverged from upstream. `--fix-repos` never force-pushes; reset `main` manually (or delete and re-create the repo with `--import-repo`) if you really want the upstream content.|
+|`reimport_action` is `unknown:workflow_check_<status>`|GitHub returned an error instead of `200`/`404` for the workflow files. Re-run later; check token scopes if it is `403`.|
 |IaC scan fails: `Veracode CLI ... Version 2.55.0 or later is required`|The runner got an old CLI. Check runner access to `tools.veracode.com`.|
 |Team cannot see IaC results|Check the team is assigned to the profile and the user is in the team. Results are under **Container & IaC Analysis**.|
 
@@ -413,7 +444,7 @@ python script.py --apply --enterprise your-enterprise-slug \
 
 ## Security Notes
 
-- Default mode is read-only. Every change needs `--apply` and a typed `yes` (or `--continue`).
+- Default mode is read-only. Every change needs `--apply` and a typed `yes` (or `--yes`, or `--continue` resuming a matching apply checkpoint).
 - Admin Veracode credentials are only used for API calls and never stored in GitHub.
 - Service account credentials are encrypted with the org's Actions public key (libsodium sealed box) before being written as secrets.
 - Agent tokens are unique per org and regenerated on each `--set-secrets` run.

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
+import fnmatch
 import functools
 import json
 import os
@@ -23,23 +25,29 @@ from email.utils import parsedate_to_datetime
 from http import cookiejar
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import quote
 
 import requests
+import yaml
 
 APP_SLUG = "veracode-workflow-app"
 INTEGRATION_REPO_NAME = "veracode"
 INTEGRATION_SOURCE_URL = "https://github.com/veracode/github-actions-integration.git"
 API_VER = "2022-11-28"
 
-_TEAMS_INJECT_RE = re.compile(
-    r"([ \t]*(?:-[ \t]+)?uses:[ \t]+veracode/(?:veracode-)?uploadandscan-action@[^\n]+\n"
-    r"(?:[ \t]+[^\n]+\n)*?"
-    r"[ \t]+with:\n)"
-    r"((?:[ \t]+[^\n]+\n)+)",
-    re.MULTILINE,
+# Teams injection walks lines (see _edit_uploadandscan_teams); every pattern
+# here is anchored to a single line, so nothing can backtrack across lines.
+_UAS_USES_RE = re.compile(
+    r"^[ \t]*(?:-[ \t]+)?uses:[ \t]*[\"']?veracode/(?:veracode-)?uploadandscan-action@",
+    re.IGNORECASE,
 )
-_TEAMS_ALREADY_SET_RE = re.compile(r"^\s+teams\s*:", re.MULTILINE)
-_TEAMS_VALUE_RE = re.compile(r'^(\s+teams\s*:\s*)["\']?([^"\'"\n]*)["\']?\s*$', re.MULTILINE)
+_UAS_USES_VALUE_RE = re.compile(r"^veracode/(?:veracode-)?uploadandscan-action@", re.IGNORECASE)
+_WITH_KEY_RE = re.compile(r"^[ \t]*(?:-[ \t]+)?(?P<key>with)[ \t]*:[ \t]*(?:#.*)?$")
+_TEAMS_KEY_RE = re.compile(r"^(?P<prefix>[ \t]*teams[ \t]*:)(?P<rest>.*)$")
+_INLINE_COMMENT_RE = re.compile(r"[ \t]+#")
+# Spelled with chr() so no editor/tool can turn the escape into a raw CR.
+_CRLF = chr(13) + chr(10)
+_EOL_CHARS = _CRLF
 
 _VERACODE_SECRET_NAMES: tuple[str, ...] = (
     "VERACODE_API_ID",
@@ -492,6 +500,25 @@ class RunStats:
     actions_allowed: int = 0
     actions_missing: int = 0
     actions_no_permission: int = 0
+    orgs_failed: int = 0      # orgs with at least one failed step (retried by --continue)
+    orgs_raised: int = 0      # orgs whose processing raised an unhandled exception
+
+
+# Counters that mean "a step was attempted and failed". Any of them > 0 makes
+# the run exit with EXIT_FAILURES.
+_FAILURE_COUNTERS: tuple[str, ...] = (
+    "secrets_fail", "yml_failed", "teams_failed", "teams_create_failed_on_platform",
+    "teams_link_failed", "default_branch_failed", "reimports_failed", "orgs_failed", "orgs_raised",
+)
+EXIT_OK = 0
+EXIT_FAILURES = 3
+EXIT_INTERRUPTED = 130
+
+
+def run_failure_count(stats: RunStats, import_requested: bool) -> int:
+    """Failed steps/orgs in this run. A missing repo is only a failure when --import-repo was asked to fix it."""
+    total = sum(getattr(stats, name) for name in _FAILURE_COUNTERS)
+    return total + (stats.repo_fail if import_requested else 0)
 
 
 # ---------------------------------------------------------------------------
@@ -524,6 +551,7 @@ class RunContext:
     report_path: Path
     checkpoint_file: Path
     do_iac_rbac: bool = True
+    secret_visibility: str = "selected"
     stats: RunStats = field(default_factory=RunStats)
     stats_lock: threading.Lock = field(default_factory=threading.Lock)
     rows_lock: threading.Lock = field(default_factory=threading.Lock)
@@ -534,6 +562,8 @@ class RunContext:
     manual_links_rows: list[list[str]] = field(default_factory=list)
     actions_allowlist_rows: list[list[str]] = field(default_factory=list)
     completed_orgs: list[str] = field(default_factory=list)
+    failed_orgs: list[str] = field(default_factory=list)
+    checkpoint_meta: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.do_set_secrets:
@@ -691,6 +721,7 @@ def _rate_limit_wait(r: requests.Response, rl_attempt: int) -> float:
                          or r.headers.get("x-ratelimit-remaining"))
         reset_hdr = r.headers.get("X-RateLimit-Reset") or r.headers.get("x-ratelimit-reset")
         exhausted = False
+        reset_passed = False
         if remaining_hdr is not None:
             try:
                 exhausted = int(remaining_hdr) <= 0
@@ -699,8 +730,13 @@ def _rate_limit_wait(r: requests.Response, rl_attempt: int) -> float:
         if exhausted and reset_hdr:
             try:
                 base = (int(reset_hdr) - time.time()) + 5
+                reset_passed = base <= 0
             except ValueError:
                 base = 0.0
+        if reset_passed:
+            # check_rate_limit() has already slept past the reset: retry
+            # right away instead of adding the 60s floor on top.
+            return random.uniform(0, 1.0)
 
     if base <= 0:
         base = 60.0
@@ -715,11 +751,27 @@ def _fault_backoff(attempt: int) -> float:
     return base + random.uniform(0, base)
 
 
+def _request_never_sent(exc: BaseException) -> bool:
+    """True when the request provably never reached the server (connect
+    timeout, refused connection, DNS failure), so even a POST is safe to resend."""
+    if isinstance(exc, requests.exceptions.ConnectTimeout):
+        return True
+    if isinstance(exc, requests.exceptions.ConnectionError):
+        text = str(exc)
+        return any(m in text for m in ("NewConnectionError", "Failed to establish a new connection",
+                                       "NameResolutionError", "getaddrinfo failed"))
+    return False
+
+
 def _retry_request(
     make_request: Callable[[], requests.Response],
     label: str,
     max_retries: int = 3,
+    idempotent: bool = True,
 ) -> requests.Response:
+    """idempotent=False (POST): a timeout or connection error after the
+    request may have been sent is raised, not retried, so a create is never
+    applied twice. Callers resolve the outcome (e.g. look the object up)."""
     if max_retries < 1:
         raise ValueError(f"max_retries must be >= 1, got {max_retries}")
     rate_limit_attempts = max(max_retries, _RATE_LIMIT_MAX_ATTEMPTS)
@@ -760,6 +812,8 @@ def _retry_request(
                 return r
             return r
         except (requests.exceptions.Timeout, requests.exceptions.RequestException) as exc:
+            if not idempotent and not _request_never_sent(exc):
+                raise
             if attempt < max_retries - 1:
                 wait = _fault_backoff(attempt)
                 label_exc = "timeout" if isinstance(exc, requests.exceptions.Timeout) else str(exc)[:50]
@@ -818,7 +872,9 @@ def request(
         if not graphql:
             check_rate_limit(r)
         return r
-    return _retry_request(make, "GITHUB", max_retries)
+    # GraphQL POSTs here are read queries; any other POST creates something.
+    return _retry_request(make, "GITHUB", max_retries,
+                          idempotent=graphql or method.upper() != "POST")
 
 
 def _veracode_auth(api_id: str, api_key: str) -> Any:
@@ -839,6 +895,31 @@ def _veracode_auth(api_id: str, api_key: str) -> Any:
     return auth
 
 
+# Veracode API ID prefixes ("vera01ei-...") carry the region in their 7th
+# character, the same rule veracode-api-signing uses to sign for that region.
+_VERACODE_REGION_BASES = {
+    "g": "https://api.veracode.com",
+    "e": "https://api.veracode.eu",
+}
+
+
+def veracode_api_base(api_id: str) -> str:
+    """API base for the credential's region. VERACODE_API_BASE overrides it."""
+    override = os.environ.get("VERACODE_API_BASE", "").strip().rstrip("/")
+    if override:
+        return override
+    region = "g"
+    if "-" in api_id:
+        prefix = api_id.split("-", 1)[0]
+        if len(prefix) == 8:
+            region = prefix[6].lower()
+    if region == "f":
+        raise RuntimeError("Veracode US Federal (FedRAMP) credentials are not supported by this tool")
+    if region not in _VERACODE_REGION_BASES:
+        raise RuntimeError(f"Veracode API ID prefix does not map to a known region ({api_id.split('-', 1)[0]}-)")
+    return _VERACODE_REGION_BASES[region]
+
+
 def veracode_request(
     method: str,
     endpoint: str,
@@ -847,7 +928,7 @@ def veracode_request(
     max_retries: int = 3,
     **kwargs: Any,
 ) -> requests.Response:
-    url = f"https://api.veracode.com{endpoint}"
+    url = f"{veracode_api_base(api_id)}{endpoint}"
     auth = _veracode_auth(api_id, api_key)
 
     def make() -> requests.Response:
@@ -856,7 +937,7 @@ def veracode_request(
             return _session().request(method, url, auth=auth, timeout=45, **kwargs)
         finally:
             _veracode_rate_limiter.release()
-    return _retry_request(make, "VERACODE", max_retries)
+    return _retry_request(make, "VERACODE", max_retries, idempotent=method.upper() != "POST")
 
 
 # ---------------------------------------------------------------------------
@@ -891,12 +972,23 @@ def paginate_list(url: str, token: str, params: dict[str, Any] | None = None) ->
 # I/O helpers
 # ---------------------------------------------------------------------------
 
-def write_csv(path: Path, header: list[str], rows: list[list[str]]) -> None:
+# Cells starting with these are run as formulas by Excel/LibreOffice/Sheets.
+_CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", chr(9), chr(13))
+
+
+def _csv_safe(value: Any) -> Any:
+    """Prefix a single quote to a string cell a spreadsheet would treat as a formula."""
+    if isinstance(value, str) and value.startswith(_CSV_FORMULA_PREFIXES):
+        return "'" + value
+    return value
+
+
+def write_csv(path: Path, header: list[str], rows: list[list[Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f, quoting=csv.QUOTE_ALL)
         writer.writerow(header)
-        writer.writerows(rows)
+        writer.writerows([_csv_safe(c) for c in row] for row in rows)
 
 
 def append_report_entry(report_path: Path, entry: dict[str, Any]) -> None:
@@ -923,11 +1015,98 @@ def finalize_report(report_path: Path) -> None:
     tmp.replace(report_path)
 
 
+# ---------------------------------------------------------------------------
+# Checkpoint (--continue)
+# ---------------------------------------------------------------------------
+# checkpoint.json records the mode and action flags of the run that wrote it,
+# the orgs that completed cleanly and the orgs that had a failed step. A
+# resumed run only uses a checkpoint written with the same mode and actions
+# (so a dry run never marks orgs as done for --apply) and retries failed orgs.
+CHECKPOINT_VERSION = 2
+_FAILED_ACTION_PREFIXES = ("error", "failed", "put_failed", "get_failed", "backup_failed", "invalid_yaml")
+_STATUS_KEYS = frozenset({"action", "status", "teams_action", "veracode_yml_action", "reimport_action",
+                          "default_branch_action"})
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write via a temp file + os.replace so a crash never leaves a truncated file."""
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        with tmp.open("w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+
+def entry_failed(entry: dict[str, Any]) -> bool:
+    """True when any step in a per-org report entry errored or failed.
+
+    The Actions allowlist check is warn-only and never fails an org.
+    """
+    def walk(node: Any, key: str | None) -> bool:
+        if isinstance(node, dict):
+            if node.get("error"):
+                return True
+            return any(walk(v, "files_item" if key == "files" else k)
+                       for k, v in node.items() if k != "actions_allowlist")
+        if isinstance(node, str) and (key in _STATUS_KEYS or key == "files_item"):
+            return node.startswith(_FAILED_ACTION_PREFIXES)
+        return False
+    return walk(entry, None)
+
+
+def checkpoint_meta_for(apply: bool, actions: list[str]) -> dict[str, Any]:
+    return {"version": CHECKPOINT_VERSION, "mode": "apply" if apply else "dry-run", "actions": sorted(actions)}
+
+
+def load_checkpoint(path: Path, meta: dict[str, Any]) -> tuple[list[str], list[str]] | None:
+    """(completed, failed) from a checkpoint written by a run with the same mode and actions, else None."""
+    if not path.exists():
+        print("[RESUME] No checkpoint.json found - starting from the beginning.\n")
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        print(f"[WARNING] Failed to load checkpoint ({exc}) - starting from the beginning.\n")
+        return None
+    theirs = {k: data.get(k) for k in ("version", "mode", "actions")}
+    if theirs != meta:
+        print(f"[RESUME] Ignoring checkpoint.json: it was written by a {theirs.get('mode') or 'older'} run "
+              f"with actions {theirs.get('actions') or '(unknown)'}; this is a {meta['mode']} run with "
+              f"actions {meta['actions'] or '(none)'}. Starting from the beginning.\n")
+        return None
+    completed = [o for o in data.get("completed", []) if isinstance(o, str)]
+    failed = [o for o in data.get("failed", []) if isinstance(o, str) and o not in completed]
+    return completed, failed
+
+
+def record_org_result(ctx: RunContext, org: str, failed: bool, log: Callable[[str], None] = tprint) -> None:
+    """Mark org completed or failed and persist the checkpoint atomically."""
+    with ctx.checkpoint_lock:
+        for lst in (ctx.completed_orgs, ctx.failed_orgs):
+            if org in lst:
+                lst.remove(org)
+        (ctx.failed_orgs if failed else ctx.completed_orgs).append(org)
+        data = {
+            **ctx.checkpoint_meta,
+            "last_org": org,
+            "processed": len(ctx.completed_orgs),
+            "completed": ctx.completed_orgs,
+            "failed": ctx.failed_orgs,
+        }
+        try:
+            _atomic_write_text(ctx.checkpoint_file, json.dumps(data, indent=2))
+        except OSError as exc:
+            log(f"  [WARNING] Failed to save checkpoint: {exc}")
+
+
 def write_teams_map_csv(path: Path, orgs: list[str]) -> None:
     with path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f, quoting=csv.QUOTE_ALL)
         writer.writerow(["org", "teams"])
-        writer.writerows([org, ""] for org in orgs)
+        writer.writerows([_csv_safe(org), ""] for org in orgs)
 
 
 def write_orgs_txt(path: Path, orgs: list[str]) -> None:
@@ -975,6 +1154,25 @@ def git_clone_bare(source_url: str) -> tuple[bool, str, str | None]:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
 
+def _git_push_env(host: str, token: str) -> dict[str, str]:
+    """Git env that authenticates to one host with a header passed through
+    GIT_CONFIG_* variables, so the token never appears in argv (visible in the
+    process list), in the remote URL, or in any credential helper/cache. An
+    empty value first resets any inherited extraheader for the host."""
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    basic = b64encode(f"x-access-token:{token}".encode()).decode()
+    settings = [
+        ("core.hooksPath", os.devnull),
+        (f"http.https://{host}/.extraheader", ""),
+        (f"http.https://{host}/.extraheader", f"Authorization: Basic {basic}"),
+    ]
+    n = int(env.get("GIT_CONFIG_COUNT") or 0)
+    for i, (key, value) in enumerate(settings, n):
+        env[f"GIT_CONFIG_KEY_{i}"], env[f"GIT_CONFIG_VALUE_{i}"] = key, value
+    env["GIT_CONFIG_COUNT"] = str(n + len(settings))
+    return env
+
+
 def git_mirror_import(
     source_url: str,
     target_org: str,
@@ -982,15 +1180,25 @@ def git_mirror_import(
     token: str,
     web_base: str = "https://github.com",
     cached_clone_dir: str | None = None,
+    mirror: bool = True,
 ) -> tuple[bool, str]:
+    """Push the upstream integration repo to target_org/target_repo.
+
+    mirror=True (`git push --mirror`) is only safe for a new or empty target:
+    it deletes every ref the target has that upstream does not. For a
+    non-empty repo pass mirror=False, which pushes refs/heads/main only,
+    without force, and reports a rejection instead of overwriting history.
+
+    With cached_clone_dir the push runs straight from the cached bare clone;
+    a push to a URL does not modify the local repo, so no per-org copy is needed.
+    """
     temp_dir: str | None = None
     try:
-        temp_dir = tempfile.mkdtemp(prefix="veracode-import-")
-        bare_repo = os.path.join(temp_dir, "repo.git")
-
         if cached_clone_dir:
-            shutil.copytree(os.path.join(cached_clone_dir, "repo.git"), bare_repo)
+            bare_repo = os.path.join(cached_clone_dir, "repo.git")
         else:
+            temp_dir = tempfile.mkdtemp(prefix="veracode-import-")
+            bare_repo = os.path.join(temp_dir, "repo.git")
             clone_result = subprocess.run(
                 ["git", "clone", "--bare", source_url, bare_repo],
                 capture_output=True, text=True, timeout=_GIT_SUBPROCESS_TIMEOUT,
@@ -999,28 +1207,28 @@ def git_mirror_import(
                 return False, f"Clone failed: {clone_result.stderr}"
 
         host = web_base.rstrip("/").removeprefix("https://").removeprefix("http://")
-        target_url = f"https://x-access-token:{token}@{host}/{target_org}/{target_repo}.git"
+        target_url = f"https://{host}/{target_org}/{target_repo}.git"
 
-        push_env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+        push_args = ["--mirror", target_url] if mirror else [target_url, "refs/heads/main:refs/heads/main"]
         push_result = subprocess.run(
             [
                 "git", "-C", bare_repo,
                 "-c", "credential.helper=",
-                "-c", "credential.helper=cache",
-                "-c", "http.https://github.com/.extraheader=",
-                "push", "--mirror", target_url,
+                "push", *push_args,
             ],
-            capture_output=True, text=True, env=push_env,
+            capture_output=True, text=True, env=_git_push_env(host, token),
             timeout=_GIT_SUBPROCESS_TIMEOUT,
         )
         if push_result.returncode != 0:
             safe_stderr = push_result.stderr.replace(token, "***")
+            if not mirror and "rejected" in safe_stderr.lower():
+                return False, ("Push rejected: 'main' has diverged from upstream; not forcing "
+                               f"(re-import manually if intended): {safe_stderr}")
             return False, f"Push failed: {safe_stderr}"
 
         return True, "Import successful"
 
     except subprocess.TimeoutExpired as exc:
-        # exc echoes the command line, which carries the token in the push URL.
         stage = "Push" if "push" in (exc.cmd or []) else "Clone"
         return False, f"{stage} timed out after {_GIT_SUBPROCESS_TIMEOUT}s"
     except Exception as exc:
@@ -1034,42 +1242,66 @@ def git_mirror_import(
 # Veracode API helpers
 # ---------------------------------------------------------------------------
 
+class VeracodeLookupError(RuntimeError):
+    """A Veracode list call failed, so whether the object exists is unknown.
+
+    Distinct from "not found" (None) so callers never create a duplicate
+    workspace/team just because a lookup hit a 5xx, 401 or 403."""
+
+
+_VERACODE_MAX_PAGES = 1000
+
+
+def _veracode_list_all(
+    endpoint: str,
+    key: str,
+    api_id: str,
+    api_key: str,
+    params: dict[str, Any] | None = None,
+    what: str = "items",
+) -> list[dict[str, Any]]:
+    """Every item of a paginated Veracode HAL list (`_embedded.<key>`, `page.total_pages`).
+    Raises VeracodeLookupError on any non-200 page."""
+    items: list[dict[str, Any]] = []
+    for page in range(_VERACODE_MAX_PAGES):
+        r = veracode_request("GET", endpoint, api_id, api_key,
+                             params={**(params or {}), "size": 100, "page": page})
+        if r.status_code != 200:
+            hint = {401: " (authentication failed - check credentials)",
+                    403: " (permission denied - insufficient role/access)"}.get(r.status_code, "")
+            raise VeracodeLookupError(
+                f"Failed to list {what}: HTTP {r.status_code}{hint} - {(r.text or '')[:200]}")
+        body = r.json()
+        items.extend(_sca_embedded_items(body, key))
+        page_meta = body.get("page", {}) if isinstance(body, dict) else {}
+        if page >= (page_meta.get("total_pages") or 1) - 1:
+            break
+    return items
+
+
 def _find_workspace_by_name(
     org_name: str,
     api_id: str,
     api_key: str,
     log: Callable[[str], None] = tprint,
 ) -> str | None:
-    page = 0
-    while True:
-        r = veracode_request(
-            "GET", "/srcclr/v3/workspaces", api_id, api_key,
-            params={"filter[workspace]": org_name, "size": 100, "page": page},
+    """Workspace id, or None when no workspace has that name.
+    Raises VeracodeLookupError when the lookup itself failed."""
+    try:
+        workspaces = _veracode_list_all(
+            "/srcclr/v3/workspaces", "workspaces", api_id, api_key,
+            params={"filter[workspace]": org_name}, what="workspaces",
         )
-        if r.status_code == 401:
-            log("  [ERROR] Veracode authentication failed - check credentials")
-            return None
-        if r.status_code == 403:
-            log("  [ERROR] Veracode permission denied - insufficient access")
-            return None
-        if r.status_code != 200:
-            log(f"  [ERROR] Failed to list workspaces: {r.status_code} - {r.text[:200]}")
-            return None
-
-        body = r.json()
-        for ws in body.get("_embedded", {}).get("workspaces", []):
-            if ws.get("name") == org_name:
-                ws_id = ws.get("id")
-                if not ws_id:
-                    log(f"  [WARNING] Workspace '{org_name}' matched but has no id in response - skipping")
-                    continue
-                return ws_id
-
-        page_meta = body.get("page", {})
-        total_pages = page_meta.get("total_pages", 1)
-        if page >= total_pages - 1:
-            break
-        page += 1
+    except VeracodeLookupError as exc:
+        log(f"  [ERROR] {exc}")
+        raise
+    for ws in workspaces:
+        if ws.get("name") == org_name:
+            ws_id = ws.get("id")
+            if not ws_id:
+                log(f"  [WARNING] Workspace '{org_name}' matched but has no id in response - skipping")
+                continue
+            return ws_id
     return None
 
 
@@ -1084,10 +1316,18 @@ def create_veracode_workspace(
         if existing_id:
             return existing_id
 
-        r = veracode_request("POST", "/srcclr/v3/workspaces", api_id, api_key, json={"name": org_name})
-        if r.status_code not in (200, 201):
-            log(f"  [ERROR] Failed to create workspace: {r.status_code} - {r.text[:200]}")
-            return None
+        try:
+            r = veracode_request("POST", "/srcclr/v3/workspaces", api_id, api_key, json={"name": org_name})
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+            # Not retried (POST may have been applied): resolve by name below.
+            log(f"  [INFO] Workspace create for '{org_name}' did not answer ({type(exc).__name__}) - "
+                f"checking whether it was created")
+        else:
+            if r.status_code in (409, 422):
+                log(f"  [INFO] Workspace '{org_name}' already exists ({r.status_code}) - looking it up")
+            elif r.status_code not in (200, 201):
+                log(f"  [ERROR] Failed to create workspace: {r.status_code} - {r.text[:200]}")
+                return None
 
         for _ in range(3):
             workspace_id = _find_workspace_by_name(org_name, api_id, api_key, log)
@@ -1102,11 +1342,10 @@ def create_veracode_workspace(
 
 
 def list_veracode_agents(workspace_id: str, api_id: str, api_key: str) -> list[dict[str, Any]] | None:
+    """All agents of the workspace (every page), or None if listing failed."""
     try:
-        r = veracode_request("GET", f"/srcclr/v3/workspaces/{workspace_id}/agents", api_id, api_key)
-        if r.status_code == 200:
-            return r.json().get("_embedded", {}).get("agents", [])
-        return None
+        return _veracode_list_all(f"/srcclr/v3/workspaces/{workspace_id}/agents", "agents",
+                                  api_id, api_key, what="agents")
     except Exception:
         return None
 
@@ -1140,12 +1379,9 @@ def create_veracode_agent_token(
                     api_id, api_key,
                 )
                 if regen.status_code == 200:
-                    access_token = regen.json().get("access_token")
-                    if access_token:
-                        return access_token
-                    log("  [ERROR] token:regenerate succeeded but no access_token in response")
-                    return None
-                log(f"  [ERROR] token:regenerate failed: {regen.status_code} - {regen.text[:200]}")
+                    return _agent_access_token(regen, "token:regenerate", log)
+                # Never log the body: it may carry a token.
+                log(f"  [ERROR] token:regenerate failed: HTTP {regen.status_code}")
                 return None
 
         r = veracode_request(
@@ -1154,69 +1390,78 @@ def create_veracode_agent_token(
             api_id, api_key,
             json={"name": agent_name, "agent_type": "CLI"},
         )
-        if r.status_code != 200:
-            log(f"  [ERROR] Failed to create agent: {r.status_code} - {r.text[:200]}")
+        if r.status_code not in (200, 201):
+            log(f"  [ERROR] Failed to create agent: HTTP {r.status_code}")
             return None
-        if not r.content:
-            log("  [ERROR] Agent POST returned empty body")
-            return None
-        try:
-            agent_body = r.json()
-        except json.JSONDecodeError:
-            log("  [ERROR] Failed to parse agent POST response")
-            return None
-
-        access_token = agent_body.get("token", {}).get("access_token")
-        if access_token:
-            return access_token
-        log(f"  [ERROR] Agent created but no token.access_token in response: {agent_body}")
-        return None
+        return _agent_access_token(r, "agent create", log)
     except Exception as exc:
-        log(f"  [ERROR] create_veracode_agent_token: {exc}")
+        log(f"  [ERROR] create_veracode_agent_token: {type(exc).__name__}")
         return None
+
+
+def _agent_access_token(r: requests.Response, what: str, log: Callable[[str], None]) -> str | None:
+    """access_token from an agent create/regenerate response, either top-level
+    or under `token`. Only the response's key names are ever logged, never values."""
+    try:
+        body = r.json() if r.content else None
+    except ValueError:
+        body = None
+    if not isinstance(body, dict):
+        log(f"  [ERROR] {what}: empty or non-JSON response")
+        return None
+    nested = body.get("token")
+    access_token = body.get("access_token") or (nested.get("access_token") if isinstance(nested, dict) else None)
+    if isinstance(access_token, str) and access_token:
+        return access_token
+    log(f"  [ERROR] {what}: no access_token in response (keys: {sorted(body)})")
+    return None
 
 
 # ---------------------------------------------------------------------------
 # Veracode Identity API - Team management
 # ---------------------------------------------------------------------------
 
+_veracode_teams_cache: dict[str, dict[str, str]] = {}  # api_id -> {team_name: team_id}
+_veracode_teams_lock = threading.Lock()
+
+
 def _find_veracode_team_by_name(
     team_name: str,
     api_id: str,
     api_key: str,
     log: Callable[[str], None] = tprint,
+    refresh: bool = False,
 ) -> str | None:
-    page = 0
-    while True:
-        r = veracode_request(
-            "GET", "/api/authn/v2/teams", api_id, api_key,
-            params={"all_for_org": "true", "size": 100, "page": page},
-        )
-        if r.status_code == 401:
-            log("  [ERROR] Veracode authentication failed (Identity API) - check credentials")
-            return None
-        if r.status_code == 403:
-            log("  [ERROR] Veracode permission denied (Identity API) - need Administrator role")
-            return None
-        if r.status_code != 200:
-            log(f"  [ERROR] Failed to list teams: {r.status_code} - {r.text[:200]}")
-            return None
+    """Identity API team_id, or None when no team has that name.
 
-        body = r.json()
-        for team in body.get("_embedded", {}).get("teams", []):
-            if team.get("team_name") == team_name:
-                tid = team.get("team_id")
-                if not tid:
-                    log(f"  [WARNING] Team '{team_name}' matched but has no team_id - skipping")
-                    continue
-                return tid
+    The full team list (every page; the API has no name filter) is fetched
+    once per run and cached; refresh=True re-reads it (e.g. after a 409).
+    Raises VeracodeLookupError when the list call failed."""
+    with _veracode_teams_lock:
+        index = _veracode_teams_cache.get(api_id)
+        if index is None or refresh:
+            try:
+                teams = _veracode_list_all(
+                    "/api/authn/v2/teams", "teams", api_id, api_key,
+                    params={"all_for_org": "true"}, what="Veracode teams (Identity API)",
+                )
+            except VeracodeLookupError as exc:
+                log(f"  [ERROR] {exc}")
+                raise
+            index = {}
+            for team in teams:
+                name, tid = team.get("team_name"), team.get("team_id")
+                if name and tid:
+                    index.setdefault(name, tid)
+            _veracode_teams_cache[api_id] = index
+        return index.get(team_name)
 
-        page_meta = body.get("page", {})
-        total_pages = page_meta.get("total_pages", 1)
-        if page >= total_pages - 1:
-            break
-        page += 1
-    return None
+
+def _remember_veracode_team(api_id: str, team_name: str, team_id: str) -> None:
+    with _veracode_teams_lock:
+        index = _veracode_teams_cache.get(api_id)
+        if index is not None:
+            index[team_name] = team_id
 
 
 def create_veracode_team(
@@ -1226,14 +1471,23 @@ def create_veracode_team(
     log: Callable[[str], None] = tprint,
 ) -> str | None:
     try:
-        r = veracode_request(
-            "POST", "/api/authn/v2/teams", api_id, api_key,
-            json={"team_name": team_name},
-        )
-        if r.status_code in (200, 201):
+        try:
+            r = veracode_request(
+                "POST", "/api/authn/v2/teams", api_id, api_key,
+                json={"team_name": team_name},
+            )
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+            # Not retried (POST may have been applied): resolve by name below.
+            log(f"  [INFO] Team create for '{team_name}' did not answer ({type(exc).__name__}) - "
+                f"checking whether it was created")
+            r = None
+        if r is None:
+            pass
+        elif r.status_code in (200, 201):
             body = r.json()
             tid = body.get("team_id")
             if tid:
+                _remember_veracode_team(api_id, team_name, tid)
                 return tid
             log(f"  [WARNING] Team POST succeeded but no team_id in response: {str(body)[:200]}")
         elif r.status_code == 409:
@@ -1243,7 +1497,7 @@ def create_veracode_team(
             return None
 
         for _ in range(3):
-            tid = _find_veracode_team_by_name(team_name, api_id, api_key, log)
+            tid = _find_veracode_team_by_name(team_name, api_id, api_key, log, refresh=True)
             if tid:
                 return tid
             time.sleep(1)
@@ -1260,7 +1514,11 @@ def ensure_veracode_team(
     api_key: str,
     log: Callable[[str], None] = tprint,
 ) -> tuple[str | None, str]:
-    existing_id = _find_veracode_team_by_name(team_name, api_id, api_key, log)
+    try:
+        existing_id = _find_veracode_team_by_name(team_name, api_id, api_key, log)
+    except VeracodeLookupError:
+        # Existence unknown: never create (could duplicate the team).
+        return None, "error"
     if existing_id:
         return existing_id, "already_exists"
 
@@ -1367,11 +1625,13 @@ def _workspace_has_team(
     log: Callable[[str], None] = tprint,
 ) -> bool | None:
     """True/False if the workspace already has the team; None if unknown."""
-    r = veracode_request("GET", f"/srcclr/v3/workspaces/{workspace_id}/teams", api_id, api_key)
-    if r.status_code != 200:
-        log(f"  [WARNING] Could not read teams of workspace {workspace_id}: {r.status_code}")
+    try:
+        teams = _veracode_list_all(f"/srcclr/v3/workspaces/{workspace_id}/teams", "teams",
+                                   api_id, api_key, what=f"teams of workspace {workspace_id}")
+    except VeracodeLookupError as exc:
+        log(f"  [WARNING] {exc}")
         return None
-    return any(str(t.get("id")) == sca_team_id for t in _sca_embedded_items(r.json(), "teams"))
+    return any(str(t.get("id")) == sca_team_id for t in teams)
 
 
 def ensure_team_linked_to_workspace(
@@ -1398,7 +1658,10 @@ def ensure_team_linked_to_workspace(
     'workspace_not_found' | 'team_not_found'.
     """
     if not workspace_id:
-        workspace_id = _find_workspace_by_name(org_name, api_id, api_key, log)
+        try:
+            workspace_id = _find_workspace_by_name(org_name, api_id, api_key, log)
+        except VeracodeLookupError:
+            return False, "error"
         if not workspace_id:
             return False, "workspace_not_found"
     if not team_id:
@@ -1472,21 +1735,53 @@ def secret_exists(
 
 
 def check_veracode_secrets_status(api_base: str, org: str, github_token: str) -> dict[str, str]:
-    results: dict[str, str] = {}
-    for secret_name in _VERACODE_SECRET_NAMES:
-        try:
-            r = request("GET", f"{api_base}/orgs/{org}/actions/secrets/{secret_name}", github_token)
-            if r.status_code == 200:
-                results[secret_name] = "exists"
-            elif r.status_code == 403:
-                results[secret_name] = "no_permission"
-            elif r.status_code == 404:
-                results[secret_name] = "missing"
-            else:
-                results[secret_name] = "error"
-        except Exception:
-            results[secret_name] = "error"
-    return results
+    """exists/missing/no_permission/error per Veracode secret, from one
+    paginated list of the org's secret names (no per-secret GETs)."""
+    names: set[str] = set()
+    next_url: str | None = f"{api_base}/orgs/{org}/actions/secrets"
+    params: dict[str, Any] | None = {"per_page": 100}
+    try:
+        while next_url:
+            r = request("GET", next_url, github_token, params=params)
+            if r.status_code in (403, 404):
+                # 404 here means the token cannot see org secrets (admin:org missing).
+                return {s: "no_permission" for s in _VERACODE_SECRET_NAMES}
+            if r.status_code != 200:
+                return {s: "error" for s in _VERACODE_SECRET_NAMES}
+            names.update(str(s.get("name")) for s in (r.json() or {}).get("secrets", []) if isinstance(s, dict))
+            link = r.headers.get("Link") or r.headers.get("link")
+            next_url = parse_link_next(link) if link else None
+            params = None
+    except Exception:
+        return {s: "error" for s in _VERACODE_SECRET_NAMES}
+    return {s: ("exists" if s in names else "missing") for s in _VERACODE_SECRET_NAMES}
+
+
+SECRET_VISIBILITIES = ("selected", "private", "all")
+
+
+def _secret_visibility_fields(
+    api_base: str,
+    org: str,
+    token: str,
+    visibility: str,
+    log: Callable[[str], None] = tprint,
+) -> dict[str, Any]:
+    """Visibility part of the org-secret PUT. 'selected' scopes the secrets to
+    the org's veracode repo only; if its id cannot be read, falls back to
+    'private' (never widens to 'all')."""
+    if visibility != "selected":
+        return {"visibility": visibility}
+    try:
+        r = request("GET", f"{api_base}/repos/{org}/{INTEGRATION_REPO_NAME}", token)
+        repo_id = r.json().get("id") if r.status_code == 200 else None
+    except Exception:
+        repo_id = None
+    if isinstance(repo_id, int):
+        return {"visibility": "selected", "selected_repository_ids": [repo_id]}
+    log(f"  [{org}] [WARNING] '{INTEGRATION_REPO_NAME}' repo id not available - "
+        f"setting secrets with visibility 'private' instead of 'selected'")
+    return {"visibility": "private"}
 
 
 def set_veracode_secrets(
@@ -1497,12 +1792,18 @@ def set_veracode_secrets(
     veracode_sa_api_key: str,
     veracode_agent_token: str,
     log: Callable[[str], None] = tprint,
+    key_info: tuple[str, str] | None = None,
+    visibility: str = "selected",
 ) -> tuple[bool, dict[str, str]]:
-    key_info = get_org_public_key(api_base, org, github_token, log)
+    """PUT the three org secrets. Pass key_info when the public key was
+    fetched up front (before rotating the agent token)."""
+    if key_info is None:
+        key_info = get_org_public_key(api_base, org, github_token, log)
     if not key_info:
         log(f"  [{org}] Could not fetch org public key - skipping secrets")
         return False, {s: "failed" for s in _VERACODE_SECRET_NAMES}
     key_id, public_key = key_info
+    visibility_fields = _secret_visibility_fields(api_base, org, github_token, visibility, log)
 
     secrets_to_set = {
         "VERACODE_API_ID": veracode_sa_api_id,
@@ -1515,24 +1816,19 @@ def set_veracode_secrets(
             payload = {
                 "encrypted_value": encrypt_secret(public_key, secret_value),
                 "key_id": key_id,
-                "visibility": "all",
+                **visibility_fields,
             }
             r = request("PUT", f"{api_base}/orgs/{org}/actions/secrets/{secret_name}", github_token, json=payload)
+            # 201/204 is GitHub's confirmation; no extra verification GET needed.
             ok = r.status_code in (201, 204)
             if not ok:
                 log(f"    [ERROR] Secret {secret_name} PUT failed: {r.status_code}")
         except Exception as exc:
             log(f"    [ERROR] Exception setting secret {secret_name}: {exc}")
             ok = False
+        results[secret_name] = "set" if ok else "failed"
 
-        if ok:
-            time.sleep(0.5)
-            verified = secret_exists(api_base, org, github_token, secret_name, log)
-            results[secret_name] = "set" if verified else "set_unverified"
-        else:
-            results[secret_name] = "failed"
-
-    all_ok = all(v.startswith("set") for v in results.values())
+    all_ok = all(v == "set" for v in results.values())
     return all_ok, results
 
 
@@ -1576,9 +1872,12 @@ def set_default_branch(
         return True, "already_main"
 
     target_exists_r = request("GET", f"{api_base}/repos/{org}/{repo}/branches/{branch}", token)
-    if target_exists_r.status_code != 200:
+    if target_exists_r.status_code == 404:
         log(f"  [{org}] Branch '{branch}' does not exist in {repo} - repo needs re-import from upstream")
         return False, "branch_not_found"
+    if target_exists_r.status_code != 200:
+        log(f"  [{org}] Could not check branch '{branch}' in {repo}: HTTP {target_exists_r.status_code}")
+        return False, "failed"
 
     r = request("PATCH", f"{api_base}/repos/{org}/{repo}", token, json={"default_branch": branch})
     if r.status_code == 200:
@@ -1691,9 +1990,17 @@ def check_repo_health(
         policy_url = f"{api_base}/repos/{org}/{repo}/contents/.github/workflows/veracode-policy-scan.yml"
         sandbox_r = request("GET", sandbox_url, token, params={"ref": "main"})
         policy_r = request("GET", policy_url, token, params={"ref": "main"})
-        if sandbox_r.status_code != 200 and policy_r.status_code != 200:
+        statuses = (sandbox_r.status_code, policy_r.status_code)
+        # Only a definite 404 for both means "missing". 5xx/403/etc. leave the
+        # state unknown, and re-importing on a guess risks clobbering the repo.
+        if statuses == (404, 404):
             log(f"  [{org}] Workflow files missing on 'main' - triggering re-import from upstream")
             needs_reimport = True
+        elif 200 not in statuses:
+            bad = next(s for s in statuses if s != 404)
+            result.reimport_action = f"unknown:workflow_check_{bad}"
+            log(f"  [{org}] Could not verify workflow files on 'main' (HTTP {bad}) - "
+                f"skipping re-import; re-run later")
 
     if needs_reimport:
         result.needs_remediation = True
@@ -1704,8 +2011,11 @@ def check_repo_health(
             result.reimport_action = "git_not_available"
             log(f"  [{org}] Git CLI not available - cannot re-import")
         else:
+            # The repo is non-empty here: never --mirror (it would delete the
+            # customer's other branches and tags). Push main only, no force.
             ok, msg = git_mirror_import(
                 INTEGRATION_SOURCE_URL, org, repo, token, web_base, cached_clone_dir,
+                mirror=False,
             )
             if not ok:
                 result.reimport_action = f"failed:{msg[:120]}"
@@ -1781,38 +2091,223 @@ def check_repo_health(
 # Workflow file injection
 # ---------------------------------------------------------------------------
 
-def _inject_teams_regex(content: str, teams_value: str) -> tuple[str, bool]:
-    changed = False
+def _is_blank_or_comment(line: str) -> bool:
+    s = line.strip()
+    return not s or s.startswith("#")
 
-    def replacer(m: re.Match) -> str:
-        nonlocal changed
-        header, body = m.group(1), m.group(2)
-        if _TEAMS_ALREADY_SET_RE.search(body):
-            return m.group(0)
-        first_param = body.splitlines()[0]
-        indent = len(first_param) - len(first_param.lstrip())
+
+def _enclosing_item(lines: list[str], idx: int) -> tuple[int, int] | None:
+    """(start, indent) of the YAML sequence item (`- ...`) that holds lines[idx]."""
+    m = _YAML_ITEM_RE.match(lines[idx])
+    if m:
+        return idx, len(m.group("indent"))
+    key_indent = _indent_of(lines[idx])
+    for i in range(idx - 1, -1, -1):
+        ln = lines[i]
+        if _is_blank_or_comment(ln):
+            continue
+        m = _YAML_ITEM_RE.match(ln)
+        if m and len(m.group("indent")) < key_indent:
+            return i, len(m.group("indent"))
+        if _indent_of(ln) < key_indent:
+            return None
+    return None
+
+
+def _block_end(lines: list[str], start: int, indent: int) -> int:
+    """Index just past the last content line after `start` indented deeper than `indent`.
+
+    Blank and comment lines never end the block and are not counted as its end.
+    """
+    last = start
+    for i in range(start + 1, len(lines)):
+        ln = lines[i]
+        if _is_blank_or_comment(ln):
+            continue
+        if _indent_of(ln) <= indent:
+            break
+        last = i
+    return last + 1
+
+
+def _parse_inline_scalar(rest: str) -> tuple[str | None, str]:
+    """Parse the text after `key:` on one line.
+
+    Returns (value, comment). value is the scalar as a string ("" for an empty
+    value) or None when it is not a scalar (flow mapping/sequence, invalid).
+    comment is the trailing `  # ...` including its leading whitespace, or "".
+    """
+    text = rest.rstrip(" \t" + _EOL_CHARS)
+    try:
+        loaded = yaml.safe_load("k:" + text)
+    except yaml.YAMLError:
+        return None, ""
+    if not isinstance(loaded, dict) or set(loaded) != {"k"} or isinstance(loaded["k"], (dict, list)):
+        return None, ""
+    comment_at = len(text)
+    for m in _INLINE_COMMENT_RE.finditer(text):
+        try:
+            if yaml.safe_load("k:" + text[:m.start()]) == loaded:
+                comment_at = m.start()
+                break
+        except yaml.YAMLError:
+            continue
+    v = loaded["k"]
+    if v is None:
+        value = ""
+    elif isinstance(v, str):
+        value = v
+    else:  # number, bool, date: keep the literal text
+        value = text[:comment_at].strip()
+    return value, text[comment_at:]
+
+
+def _edit_uploadandscan_teams(content: str, teams_value: str, update_existing: bool) -> tuple[str, bool, str]:
+    """Set `teams` in the `with:` block of every uploadandscan-action step.
+
+    Walks lines instead of matching one regex over the whole step, so it is
+    linear, handles CRLF and `with:  # comment`, and never looks outside the
+    step's own `with:` block (a `teams:` elsewhere is neither changed nor
+    mistaken for this one). Returns (content, changed, action); action is
+    teams_updated, already_current, unrecognized_teams_value or
+    uploadandscan_step_not_found.
+    """
+    eol = _CRLF if _CRLF in content else "\n"
+    lines = content.splitlines(keepends=True)
+    found = changed = unrecognized = False
+    i = 0
+    while i < len(lines):
+        if not _UAS_USES_RE.match(lines[i]):
+            i += 1
+            continue
+        uses_idx = i
+        i += 1
+        item = _enclosing_item(lines, uses_idx)
+        if item is None:
+            continue
+        start, item_indent = item
+        step_end = _block_end(lines, start, item_indent)
+        key_col = re.match(r"[ \t]*(?:-[ \t]+)?", lines[uses_idx]).end()  # type: ignore[union-attr]
+        with_idx = None
+        for j in range(start, step_end):
+            wm = _WITH_KEY_RE.match(lines[j].rstrip(_EOL_CHARS))
+            if wm and wm.start("key") == key_col:
+                with_idx = j
+                break
+        if with_idx is None:
+            continue
+        found = True
+        body_end = _block_end(lines, with_idx, key_col)
+        params = [j for j in range(with_idx + 1, body_end) if not _is_blank_or_comment(lines[j])]
+        p_indent = min(_indent_of(lines[j]) for j in params) if params else key_col + 2
+        teams_idx = next(
+            (j for j in params if _indent_of(lines[j]) == p_indent and _TEAMS_KEY_RE.match(lines[j].rstrip(_EOL_CHARS))),
+            None,
+        )
+        if teams_idx is None:
+            lines.insert(with_idx + 1, " " * p_indent + "teams: " + _yaml_dq(teams_value) + eol)
+            changed = True
+            i = body_end + 1
+            continue
+        i = body_end
+        tm = _TEAMS_KEY_RE.match(lines[teams_idx].rstrip(_EOL_CHARS))
+        assert tm is not None
+        val_end = _block_end(lines, teams_idx, p_indent)
+        comment = ""
+        current: str | None
+        if val_end > teams_idx + 1:
+            # Block value (sequence or block scalar) on the following lines.
+            snippet = "teams:" + tm.group("rest") + "\n" + "".join(
+                ln.rstrip(_EOL_CHARS) + "\n" for ln in lines[teams_idx + 1:val_end])
+            try:
+                v = yaml.safe_load(snippet)["teams"]
+            except (yaml.YAMLError, TypeError, KeyError):
+                v = {}
+            if isinstance(v, list) and all(isinstance(x, str) for x in v):
+                current = ", ".join(v) if v else ""
+                current = None if current == teams_value else current  # list -> scalar is a change
+            elif isinstance(v, str):
+                current = v
+            else:
+                unrecognized = True
+                continue
+        else:
+            current, comment = _parse_inline_scalar(tm.group("rest"))
+            if current is None:
+                unrecognized = True
+                continue
+        if current == teams_value or (current and not update_existing):
+            continue
+        line_eol = _CRLF if lines[teams_idx].endswith(_CRLF) else eol
+        lines[teams_idx:val_end] = [tm.group("prefix") + " " + _yaml_dq(teams_value) + comment + line_eol]
         changed = True
-        safe_value = teams_value.replace('"', '\\"')
-        return header + " " * indent + f'teams: "{safe_value}"\n' + body
+        i = teams_idx + 1
+    if changed:
+        return "".join(lines), True, "teams_updated"
+    if unrecognized:
+        return content, False, "unrecognized_teams_value"
+    return content, False, ("already_current" if found else "uploadandscan_step_not_found")
 
-    return _TEAMS_INJECT_RE.sub(replacer, content), changed
+
+def _load_yaml(text: str) -> tuple[bool, Any]:
+    try:
+        return True, yaml.safe_load(text)
+    except yaml.YAMLError:
+        return False, None
 
 
-def _update_teams_value(content: str, teams_value: str) -> tuple[str, bool]:
-    safe_value = teams_value.replace('"', '\\"')
-    changed = False
+def _iter_steps(doc: Any) -> Iterator[tuple[str, dict[str, Any]]]:
+    jobs = doc.get("jobs") if isinstance(doc, dict) else None
+    if not isinstance(jobs, dict):
+        return
+    for job_name, job in jobs.items():
+        steps = job.get("steps") if isinstance(job, dict) else None
+        if isinstance(steps, list):
+            for st in steps:
+                if isinstance(st, dict):
+                    yield job_name, st
 
-    def replacer(m: re.Match) -> str:
-        nonlocal changed
-        prefix = m.group(1)
-        current_value = m.group(2).strip()
-        if current_value == teams_value or current_value == safe_value:
-            return m.group(0)
-        changed = True
-        return f'{prefix}"{safe_value}"'
 
-    new_content = _TEAMS_VALUE_RE.sub(replacer, content)
-    return new_content, changed
+def _is_uas_step(step: dict[str, Any]) -> bool:
+    return bool(_UAS_USES_VALUE_RE.match(str(step.get("uses", ""))))
+
+
+def _workflow_edit_is_valid(workflow_path: str, old: str, new: str, teams_value: str) -> bool:
+    """The edited workflow must parse and differ from the original only in the managed key."""
+    ok_old, d_old = _load_yaml(old)
+    ok_new, d_new = _load_yaml(new)
+    if not (ok_old and ok_new and isinstance(d_old, dict) and isinstance(d_new, dict)):
+        return False
+    if workflow_path == IAC_WORKFLOW_PATH:
+        hits = [(j, s) for j, s in _iter_steps(d_new) if s.get("id") == "veracode_iac_scan"]
+        if len(hits) != 1:
+            return False
+        job, step = hits[0]
+        step_env = step.get("env")
+        if not isinstance(step_env, dict) or step_env.get("VERACODE_TEAMS") != normalize_teams_for_cli(teams_value):
+            return False
+        if _IAC_RBAC_MARKER in old:  # teams update: nothing but VERACODE_TEAMS may change
+            a, b = copy.deepcopy(d_old), copy.deepcopy(d_new)
+            for d in (a, b):
+                for _, s in _iter_steps(d):
+                    if s.get("id") == "veracode_iac_scan" and isinstance(s.get("env"), dict):
+                        s["env"].pop("VERACODE_TEAMS", None)
+            return a == b
+        # conversion: only the job holding the scanner step may change
+        if not isinstance(d_old.get("jobs"), dict):
+            return False
+        return ({k: v for k, v in d_old.items() if k != "jobs"} == {k: v for k, v in d_new.items() if k != "jobs"}
+                and {j: v for j, v in d_old["jobs"].items() if j != job}
+                == {j: v for j, v in d_new["jobs"].items() if j != job})
+    a, b = copy.deepcopy(d_old), copy.deepcopy(d_new)
+    for d in (a, b):
+        for _, s in _iter_steps(d):
+            if _is_uas_step(s) and isinstance(s.get("with"), dict):
+                s["with"].pop("teams", None)
+    if a != b:
+        return False
+    return any(_is_uas_step(s) and isinstance(s.get("with"), dict) and s["with"].get("teams") == teams_value
+               for _, s in _iter_steps(d_new))
 
 
 # ---------------------------------------------------------------------------
@@ -1834,13 +2329,13 @@ _IAC_ACTION_USES_RE = re.compile(
     re.IGNORECASE,
 )
 _YAML_ITEM_RE = re.compile(r"^(?P<indent>[ \t]*)-(?:[ \t]|$)")
-_IAC_TEAMS_LINE_RE = re.compile(r"^(?P<prefix>[ \t]+VERACODE_TEAMS:[ \t]*)(?P<value>[^\n]*?)[ \t]*$", re.MULTILINE)
+_IAC_TEAMS_LINE_RE = re.compile(r"^(?P<prefix>[ \t]+VERACODE_TEAMS:[ \t]*)(?P<value>[^\n\x0d]*?)[ \t]*(?=\x0d?$)", re.MULTILINE)
 
 _IAC_RBAC_STEP_BLOCK = r"""      # veracode-iac-rbac (managed by Workflow-App-Bulk-Enterprise-Integration script.py)
       # Runs the Veracode CLI directly instead of veracode/container_iac_secrets_scanning so
       # IaC/secrets results are linked to the application profile and its teams (RBAC).
       # Requires Veracode CLI 2.55.0 or later; the latest CLI is installed on every run.
-      - name: Run Veracode IaC/Secrets Scanning
+      - name: Run Veracode IaC/Secrets Scanning (team RBAC)
         id: veracode_iac_scan
         shell: bash
         env:
@@ -2050,11 +2545,18 @@ _IAC_RBAC_STEP_BLOCK = r"""      # veracode-iac-rbac (managed by Workflow-App-Bu
 
 
 def _yaml_dq(value: str) -> str:
-    """YAML double-quoted scalar."""
-    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    """YAML double-quoted scalar (backslash, quote and line breaks escaped)."""
+    out = value.replace("\\", "\\\\").replace('"', '\\"')
+    for ch, esc in ((chr(10), "n"), (chr(13), "r"), (chr(9), "t")):
+        out = out.replace(ch, "\\" + esc)
+    return '"' + out + '"'
 
 
 def _yaml_scalar_value(raw: str) -> str:
+    """Value of a one-line YAML scalar; a trailing ` # comment` is not part of it."""
+    value, _ = _parse_inline_scalar(" " + raw)
+    if value is not None:
+        return value
     raw = raw.strip()
     if len(raw) >= 2 and raw[0] == raw[-1] == '"':
         return raw[1:-1].replace('\\"', '"').replace("\\\\", "\\")
@@ -2073,24 +2575,24 @@ def _indent_of(line: str) -> int:
     return len(line) - len(line.lstrip(" \t"))
 
 
-def _render_iac_block(teams_value: str, item_indent: int) -> str:
+def _render_iac_block(teams_value: str, item_indent: int, eol: str = "\n") -> str:
     block = _IAC_RBAC_STEP_BLOCK.replace(
         _IAC_TEAMS_PLACEHOLDER,
         f"          VERACODE_TEAMS: {_yaml_dq(normalize_teams_for_cli(teams_value))}\n",
         1,
     )
     delta = item_indent - _IAC_BLOCK_INDENT
-    if delta == 0:
-        return block
-    out: list[str] = []
-    for line in block.splitlines(keepends=True):
-        if not line.strip():
-            out.append(line)
-        elif delta > 0:
-            out.append(" " * delta + line)
-        else:
-            out.append(line[min(-delta, _indent_of(line)):])
-    return "".join(out)
+    if delta != 0:
+        out: list[str] = []
+        for line in block.splitlines(keepends=True):
+            if not line.strip():
+                out.append(line)
+            elif delta > 0:
+                out.append(" " * delta + line)
+            else:
+                out.append(line[min(-delta, _indent_of(line)):])
+        block = "".join(out)
+    return block if eol == "\n" else block.replace("\n", eol)
 
 
 def _replace_iac_action_step(content: str, teams_value: str) -> tuple[str, bool]:
@@ -2138,9 +2640,10 @@ def _replace_iac_action_step(content: str, teams_value: str) -> tuple[str, bool]
 
     rest = "".join(lines[end:])
     before = "".join(lines[:start])
-    block = _render_iac_block(teams_value, item_indent)
+    eol = _CRLF if _CRLF in content else "\n"
+    block = _render_iac_block(teams_value, item_indent, eol)
     # Keep a blank line between the block and whatever followed the old step.
-    sep = "\n" if rest and rest.split("\n", 1)[0].strip() else ""
+    sep = eol if rest and rest.split("\n", 1)[0].strip() else ""
     return before + block + sep + rest, True
 
 
@@ -2150,13 +2653,15 @@ def _update_iac_teams_value(content: str, teams_value: str, update_existing: boo
 
     def replacer(m: re.Match) -> str:
         nonlocal changed
-        current = _yaml_scalar_value(m.group("value"))
+        current, comment = _parse_inline_scalar(" " + m.group("value"))
+        if current is None:
+            current, comment = _yaml_scalar_value(m.group("value")), ""
         if current == desired:
             return m.group(0)
         if current and not update_existing:
             return m.group(0)
         changed = True
-        return m.group("prefix") + _yaml_dq(desired)
+        return m.group("prefix") + _yaml_dq(desired) + comment
 
     return _IAC_TEAMS_LINE_RE.sub(replacer, content, count=1), changed
 
@@ -2179,15 +2684,19 @@ def apply_iac_rbac(content: str, teams_value: str, update_existing: bool = True)
 def _apply_teams_to_workflow(
     workflow_path: str, content: str, teams_value: str, update_existing: bool,
 ) -> tuple[str, bool, str]:
-    """Return (new_content, changed, action) for one workflow file."""
+    """Return (new_content, changed, action) for one workflow file.
+
+    A change is only returned when the result parses as YAML and differs from
+    the original in nothing but the managed teams key (or, for an IaC
+    conversion, the scanner job); otherwise action is invalid_yaml.
+    """
     if workflow_path == IAC_WORKFLOW_PATH:
-        return apply_iac_rbac(content, teams_value, update_existing)
-    new_content, was_injected = _inject_teams_regex(content, teams_value)
-    was_updated = False
-    if update_existing:
-        new_content, was_updated = _update_teams_value(new_content, teams_value)
-    changed = was_injected or was_updated
-    return new_content, changed, ("teams_updated" if changed else "already_current")
+        new_content, changed, action = apply_iac_rbac(content, teams_value, update_existing)
+    else:
+        new_content, changed, action = _edit_uploadandscan_teams(content, teams_value, update_existing)
+    if changed and not _workflow_edit_is_valid(workflow_path, content, new_content, teams_value):
+        return content, False, "invalid_yaml"
+    return new_content, changed, action
 
 
 def inject_teams_into_workflows(
@@ -2237,6 +2746,12 @@ def inject_teams_into_workflows(
                 if action == "action_step_not_found":
                     log(f"  [{org}] {file_name}: veracode/container_iac_secrets_scanning step not found - "
                         f"IaC RBAC not applied, manual review needed.")
+                elif action == "invalid_yaml":
+                    log(f"  [{org}] {file_name}: edit would not produce valid YAML (or would change "
+                        f"other keys) - not written, manual review needed.")
+                elif action == "unrecognized_teams_value":
+                    log(f"  [{org}] {file_name}: existing 'teams' value is not a plain string or list - "
+                        f"not changed, manual review needed.")
                 record(workflow_path, action)
                 continue
 
@@ -2264,9 +2779,12 @@ def inject_teams_into_workflows(
             if r_refetch.status_code == 200:
                 fresh_sha = r_refetch.json().get("sha")
                 fresh_content = b64decode(r_refetch.json().get("content", "")).decode("utf-8")
-                fresh_new, _, _ = _apply_teams_to_workflow(
+                fresh_new, fresh_changed, fresh_action = _apply_teams_to_workflow(
                     workflow_path, fresh_content, teams_value, update_existing,
                 )
+                if not fresh_changed:
+                    record(workflow_path, fresh_action)
+                    continue
                 payload["sha"] = fresh_sha
                 payload["content"] = b64encode(fresh_new.encode("utf-8")).decode("utf-8")
                 r = request("PUT", url, token, json=payload)
@@ -2310,7 +2828,19 @@ def _put_veracode_yml_with_backup(
     preread: requests.Response | None = None,
 ) -> tuple[bool, str]:
     """`preread`: reuse an existing GET of this same URL at ref=main (its sha is
-    used for the update). Only valid if no write happened in between."""
+    used for the update). Only valid if no write happened in between.
+
+    The template is parsed first and never written unless it is a YAML
+    mapping (`invalid_yaml`). Nothing is written when veracode.yml already has
+    the template's content (`already_current`). The customer's original is
+    copied to default-veracode.yml only when no backup exists yet, so re-runs
+    never replace it with an earlier Bulk template; if that backup cannot be
+    written (or its existence checked) veracode.yml is left untouched and
+    `backup_failed:<status>` is returned.
+    """
+    ok_yaml, parsed = _load_yaml(yml_content)
+    if not ok_yaml or not isinstance(parsed, dict):
+        return False, "invalid_yaml"
     veracode_url = f"{api_base}/repos/{org}/{repo}/contents/veracode.yml"
     default_veracode_url = f"{api_base}/repos/{org}/{repo}/contents/default-veracode.yml"
 
@@ -2319,16 +2849,24 @@ def _put_veracode_yml_with_backup(
         original_data = r.json()
         original_sha = original_data.get("sha")
         original_content_b64 = original_data.get("content", "")
+        try:
+            original_text = b64decode(original_content_b64).decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            original_text = None
+        if original_text is not None and original_text.replace(_CRLF, "\n") == yml_content.replace(_CRLF, "\n"):
+            return True, "already_current"
 
         r_default = request("GET", default_veracode_url, token, params={"ref": "main"})
-        backup_payload: dict[str, Any] = {
-            "message": "Preserve current veracode.yml as default-veracode.yml before update",
-            "content": original_content_b64,
-            "branch": "main",
-        }
-        if r_default.status_code == 200:
-            backup_payload["sha"] = r_default.json().get("sha")
-        request("PUT", default_veracode_url, token, json=backup_payload)
+        if r_default.status_code == 404:
+            r_backup = request("PUT", default_veracode_url, token, json={
+                "message": "Preserve current veracode.yml as default-veracode.yml before update",
+                "content": original_content_b64,
+                "branch": "main",
+            })
+            if r_backup.status_code not in (200, 201):
+                return False, f"backup_failed:{r_backup.status_code}"
+        elif r_default.status_code != 200:
+            return False, f"backup_failed:{r_default.status_code}"
 
         r_put = request("PUT", veracode_url, token, json={
             "message": update_message,
@@ -2349,12 +2887,33 @@ def _put_veracode_yml_with_backup(
     return False, f"get_failed:{r.status_code}"
 
 
-def fetch_upstream_veracode_yml() -> str | None:
-    url = (
-        f"https://raw.githubusercontent.com/"
-        f"{INTEGRATION_SOURCE_URL.removeprefix('https://github.com/').removesuffix('.git')}"
-        f"/main/veracode.yml"
-    )
+UPSTREAM_REPO_SLUG = INTEGRATION_SOURCE_URL.removeprefix("https://github.com/").removesuffix(".git")
+_UPSTREAM_REF_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._/-]*$")
+
+
+def resolve_upstream_ref(ref: str | None) -> str | None:
+    """Ref to fetch upstream files from: the given branch/tag, or (None/'latest')
+    the latest release tag of the upstream integration repo. None on error."""
+    if ref and ref != "latest":
+        if not _UPSTREAM_REF_RE.match(ref) or ".." in ref:
+            print(f"  [ERROR] Invalid --upstream-ref {ref!r}", file=sys.stderr)
+            return None
+        return ref
+    url = f"https://api.github.com/repos/{UPSTREAM_REPO_SLUG}/releases/latest"
+    try:
+        r = _session().get(url, timeout=30, headers={"Accept": "application/vnd.github+json"})
+        tag = r.json().get("tag_name") if r.status_code == 200 else None
+    except (requests.exceptions.RequestException, ValueError, AttributeError):
+        tag = None
+    if not isinstance(tag, str) or not _UPSTREAM_REF_RE.match(tag):
+        print(f"  [ERROR] Could not determine the latest release of {UPSTREAM_REPO_SLUG}. "
+              f"Pass --upstream-ref TAG (or 'main').", file=sys.stderr)
+        return None
+    return tag
+
+
+def fetch_upstream_veracode_yml(ref: str = "main") -> str | None:
+    url = f"https://raw.githubusercontent.com/{UPSTREAM_REPO_SLUG}/{quote(ref, safe='/')}/veracode.yml"
     # Different host, own budget: not routed through the GitHub limiter.
     for attempt in range(3):
         try:
@@ -2487,6 +3046,21 @@ def _looks_like_graphql_timeout(errors: list[Any]) -> bool:
     return False
 
 
+def _graphql_rate_limited(errors: list[Any]) -> bool:
+    return any(isinstance(e, dict) and str(e.get("type", "")).upper() == "RATE_LIMITED" for e in errors)
+
+
+def _graphql_reset_wait(r: requests.Response) -> float:
+    """Seconds until X-RateLimit-Reset (+ jitter), capped; 60s when unknown."""
+    reset_hdr = r.headers.get("X-RateLimit-Reset") or r.headers.get("x-ratelimit-reset")
+    try:
+        base = float(reset_hdr) - time.time() + 1 if reset_hdr else 60.0
+    except ValueError:
+        base = 60.0
+    base = min(max(base, 1.0), float(_MAX_RATE_LIMIT_TOTAL_WAIT))
+    return base + random.uniform(0, 5.0)
+
+
 def list_orgs_graphql(
     api_base: str,
     token: str,
@@ -2523,6 +3097,7 @@ def list_orgs_graphql(
     total_last: int | None = None
     cursor: str | None = None
     attempts = 0
+    rate_limit_waits = 0
     page_no = 0
 
     def fail_or_backoff(reason: str, shrink: bool) -> None:
@@ -2584,6 +3159,21 @@ def list_orgs_graphql(
         errors = payload.get("errors") or []
         ent = (payload.get("data") or {}).get("enterprise")
         conn = (ent or {}).get("organizations")
+        remaining = r.headers.get("X-RateLimit-Remaining") or r.headers.get("x-ratelimit-remaining")
+        if _graphql_rate_limited(errors) or (conn is None and str(remaining).strip() == "0"):
+            # GraphQL reports an exhausted budget as HTTP 200 + errors[RATE_LIMITED];
+            # wait for the window to reset and re-request the same cursor.
+            rate_limit_waits += 1
+            if rate_limit_waits > _RATE_LIMIT_MAX_ATTEMPTS:
+                raise OrgDiscoveryError(
+                    f"GraphQL rate limit still exhausted after {rate_limit_waits - 1} waits "
+                    f"({len(all_orgs)} orgs fetched so far). Retry later or pass --orgs-file."
+                )
+            wait = _graphql_reset_wait(r)
+            tprint(f"  [GRAPHQL] Rate limited on page {page_no + 1}; waiting {wait:.0f}s for the "
+                   f"limit to reset ({rate_limit_waits}/{_RATE_LIMIT_MAX_ATTEMPTS})")
+            time.sleep(wait)
+            continue
         if conn is None:
             if _looks_like_graphql_timeout(errors):
                 fail_or_backoff("GraphQL timeout error", shrink=True)
@@ -2620,6 +3210,7 @@ def list_orgs_graphql(
             total_last = tc
 
         attempts = 0
+        rate_limit_waits = 0
         page_no += 1
         page_info = conn.get("pageInfo") or {}
         if not page_info.get("hasNextPage"):
@@ -2735,7 +3326,15 @@ def create_repo(api_base: str, org: str, repo: str, token: str) -> None:
         "auto_init": False,
         "description": "Veracode GitHub Workflow Integration (imported template workflows & config).",
     }
-    r = request("POST", f"{api_base}/orgs/{org}/repos", token, json=payload)
+    try:
+        r = request("POST", f"{api_base}/orgs/{org}/repos", token, json=payload)
+    except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+        # POSTs are not retried once possibly sent: check whether it landed.
+        if repo_exists(api_base, org, repo, token):
+            return
+        raise
+    if r.status_code == 422 and "already exists" in (r.text or "").lower():
+        return  # created by an earlier attempt or run: same end state
     if r.status_code not in (200, 201):
         raise RuntimeError(f"{org}/{repo}: repo create failed {r.status_code} {r.text}")
 
@@ -2810,7 +3409,7 @@ def ensure_veracode_repo_imported(
         details["_repo_confirmed_present"] = True
         if do_apply:
             _run_post_import_steps()
-            if "veracode_yml_injected" in details:
+            if details.get("veracode_yml_injected") not in (None, "already_current"):
                 details["status"] = "repo_exists_post_import_incomplete"
         return True, details
 
@@ -2831,7 +3430,8 @@ def ensure_veracode_repo_imported(
             log(f"  [{org}] Git CLI not available - skipping auto import")
         else:
             ok, message = git_mirror_import(
-                INTEGRATION_SOURCE_URL, org, INTEGRATION_REPO_NAME, token, web_base, cached_clone_dir
+                INTEGRATION_SOURCE_URL, org, INTEGRATION_REPO_NAME, token, web_base, cached_clone_dir,
+                mirror=True,  # new or empty repo only: nothing to prune
             )
             if ok:
                 log(f"  [{org}] Push succeeded - waiting for GitHub to process the import (up to 15 min)...")
@@ -2863,12 +3463,27 @@ def ensure_veracode_repo_imported(
 # App installation helpers
 # ---------------------------------------------------------------------------
 
+def paginate_wrapped(url: str, token: str, key: str, params: dict[str, Any] | None = None) -> Iterator[dict[str, Any]]:
+    """Like paginate_list, for endpoints that wrap the page in an object
+    (`{"total_count": N, "<key>": [...]}`), following Link rel="next"."""
+    next_url: str | None = url
+    params = {"per_page": 100, **(params or {})}
+    while next_url:
+        r = request("GET", next_url, token, params=params)
+        if r.status_code >= 400:
+            raise RuntimeError(f"GET {next_url} failed: {r.status_code} {(r.text or '')[:200]}")
+        data = r.json() or {}
+        yield from (i for i in data.get(key, []) if isinstance(i, dict))
+        link = r.headers.get("Link") or r.headers.get("link")
+        next_url = parse_link_next(link) if link else None
+        params = None
+
+
 def list_org_installations(api_base: str, org: str, token: str) -> list[dict[str, Any]]:
-    r = request("GET", f"{api_base}/orgs/{org}/installations", token,
-                params={"per_page": 100})
-    if r.status_code >= 400:
-        raise RuntimeError(f"{org}: cannot list installations ({r.status_code}) {r.text}")
-    return r.json().get("installations", [])
+    try:
+        return list(paginate_wrapped(f"{api_base}/orgs/{org}/installations", token, "installations"))
+    except RuntimeError as exc:
+        raise RuntimeError(f"{org}: cannot list installations ({exc})") from None
 
 
 def find_app_installation(api_base: str, org: str, token: str, app_slug: str) -> dict[str, Any] | None:
@@ -2911,13 +3526,42 @@ def check_app_installed(api_base: str, web_base: str, org: str, token: str) -> t
 # Actions allowlist prerequisite check
 # ---------------------------------------------------------------------------
 
+def _action_allowed(required: str, patterns: list[str]) -> bool:
+    """GitHub-style allowlist match for a required `owner/repo@*` action.
+
+    GitHub matches case-insensitively and supports `owner/*`, `owner/repo`,
+    `owner/repo@*` and `owner/repo@ref` (plus `*` wildcards). The integration
+    pins its own refs, so any entry whose name part matches owner/repo covers it."""
+    name = required.split("@", 1)[0].lower()
+    for pat in patterns:
+        if not isinstance(pat, str) or not pat.strip():
+            continue
+        pat_name = pat.strip().lower().split("@", 1)[0]
+        if fnmatch.fnmatchcase(name, pat_name):
+            return True
+    return False
+
+
+def _veracode_repo_enabled_for_actions(api_base: str, org: str, token: str) -> bool | None:
+    """With enabled_repositories=selected: is the veracode repo in the list?
+    None when the list cannot be read."""
+    try:
+        for repo in paginate_wrapped(f"{api_base}/orgs/{org}/actions/permissions/repositories",
+                                     token, "repositories"):
+            if str(repo.get("name", "")).lower() == INTEGRATION_REPO_NAME:
+                return True
+        return False
+    except RuntimeError:
+        return None
+
+
 def check_actions_allowlist(api_base: str, org: str, token: str) -> dict[str, Any]:
     """
     Verify the org's GitHub Actions policy permits the actions the integration needs.
 
     Returns a dict with:
       status: 'all_allowed' | 'local_only' | 'selected_ok' | 'selected_missing'
-              | 'no_permission' | 'error'
+              | 'actions_disabled' | 'repo_not_enabled' | 'no_permission' | 'error'
       missing: list of required patterns not allowlisted (only for selected_missing)
       detail: short human-readable note
     """
@@ -2928,7 +3572,22 @@ def check_actions_allowlist(api_base: str, org: str, token: str) -> dict[str, An
         if r.status_code != 200:
             return {"status": "error", "missing": [], "detail": f"permissions GET {r.status_code}"}
 
-        allowed = r.json().get("allowed_actions")
+        perms = r.json()
+        enabled = perms.get("enabled_repositories")
+        if enabled == "none":
+            return {"status": "actions_disabled", "missing": [],
+                    "detail": "GitHub Actions is disabled for all repositories in the org"}
+        if enabled == "selected":
+            in_list = _veracode_repo_enabled_for_actions(api_base, org, token)
+            if in_list is None:
+                return {"status": "no_permission", "missing": [],
+                        "detail": "cannot read the org's Actions-enabled repository list"}
+            if not in_list:
+                return {"status": "repo_not_enabled", "missing": [],
+                        "detail": f"Actions is enabled only for selected repos and "
+                                  f"'{INTEGRATION_REPO_NAME}' is not one of them"}
+
+        allowed = perms.get("allowed_actions")
 
         if allowed == "all":
             return {"status": "all_allowed", "missing": [], "detail": "all actions permitted"}
@@ -2949,16 +3608,14 @@ def check_actions_allowlist(api_base: str, org: str, token: str) -> dict[str, An
 
             body = sr.json()
             github_owned_allowed = bool(body.get("github_owned_allowed"))
-            patterns = set(body.get("patterns_allowed") or [])
+            patterns = list(body.get("patterns_allowed") or [])
 
             missing: list[str] = []
             for pat in _REQUIRED_ACTION_PATTERNS:
-                if pat.startswith(_GITHUB_OWNED_PREFIX):
-                    if not github_owned_allowed and pat not in patterns:
-                        missing.append(pat)
-                else:
-                    if pat not in patterns:
-                        missing.append(pat)
+                if pat.startswith(_GITHUB_OWNED_PREFIX) and github_owned_allowed:
+                    continue
+                if not _action_allowed(pat, patterns):
+                    missing.append(pat)
 
             if missing:
                 return {
@@ -2978,13 +3635,83 @@ def check_actions_allowlist(api_base: str, org: str, token: str) -> dict[str, An
 # Credential validation
 # ---------------------------------------------------------------------------
 
+_SCOPE_IMPLIED_BY: dict[str, tuple[str, ...]] = {
+    "read:org": ("admin:org", "write:org"),
+    "read:enterprise": ("admin:enterprise",),
+}
+
+
+def required_github_scopes(
+    *, enterprise: bool, writes_workflows: bool,
+) -> dict[str, str]:
+    """Classic PAT scopes the run needs -> what they are needed for."""
+    scopes = {
+        "admin:org": "org secrets, Actions policy, app installation check",
+        "repo": "reading/creating the veracode repo",
+    }
+    if writes_workflows:
+        scopes["workflow"] = "writing .github/workflows/* in the veracode repo"
+    if enterprise:
+        scopes["read:enterprise"] = "--enterprise org discovery"
+    return scopes
+
+
+def missing_github_scopes(granted_header: str, required: dict[str, str]) -> list[str]:
+    granted = {s.strip() for s in granted_header.split(",") if s.strip()}
+    return [s for s in required
+            if s not in granted and not any(g in granted for g in _SCOPE_IMPLIED_BY.get(s, ()))]
+
+
+def _probe_veracode(
+    label: str,
+    endpoint: str,
+    api_id: str,
+    api_key: str,
+    errors: list[str],
+    params: dict[str, Any] | None = None,
+    forbidden_msg: str | None = None,
+    forbidden_is_error: bool = True,
+) -> None:
+    try:
+        r = veracode_request("GET", endpoint, api_id, api_key, params=params)
+        if r.status_code == 200:
+            print(f"  [OK] {label} valid")
+        elif r.status_code == 401:
+            errors.append(f"{label} are invalid")
+            print(f"  [FAIL] {label}: authentication failed")
+        elif r.status_code == 403 and not forbidden_is_error:
+            print(f"  [WARN] {label}: authenticated, but this probe is not permitted (HTTP 403)")
+        elif r.status_code == 403:
+            errors.append(forbidden_msg or f"{label} lack required permissions")
+            print(f"  [FAIL] {label}: permission denied")
+        else:
+            errors.append(f"{label}: Veracode API returned unexpected status {r.status_code}")
+            print(f"  [FAIL] {label}: Veracode API error {r.status_code}")
+    except Exception as exc:
+        errors.append(f"{label}: Veracode API connection failed: {str(exc)[:100]}")
+        print(f"  [FAIL] {label}: connection error: {str(exc)[:80]}")
+
+
 def validate_credentials(
     api_base: str,
     token: str,
     veracode_api_id: str | None,
     veracode_api_key: str | None,
     check_veracode: bool,
+    veracode_sa_api_id: str | None = None,
+    veracode_sa_api_key: str | None = None,
+    check_teams_api: bool = False,
+    required_scopes: dict[str, str] | None = None,
 ) -> tuple[bool, list[str]]:
+    """Fail fast on bad credentials before touching any org.
+
+    - VERACODE_API_*: SCA workspaces probe (check_veracode); with
+      check_teams_api (--create-teams) also the Identity API teams list,
+      which needs the Administrator role.
+    - VERACODE_SA_API_* (when given, i.e. --set-secrets): Identity API
+      users/self, so invalid credentials are not written into every org.
+    - Classic PAT scopes (X-OAuth-Scopes) vs required_scopes: warning only.
+    """
     errors: list[str] = []
     print("\n[VALIDATION] Checking credentials...")
 
@@ -2993,8 +3720,14 @@ def validate_credentials(
         if r.status_code == 200:
             username = r.json().get("login", "unknown")
             print(f"  [OK] GitHub token valid (user: {username})")
-            scopes = r.headers.get("X-OAuth-Scopes", "")
-            print(f"  [OK] GitHub token scopes: {scopes}" if scopes else "  [WARN] Could not determine GitHub token scopes")
+            scopes = r.headers.get("X-OAuth-Scopes")
+            if scopes is None:
+                print("  [WARN] Could not determine GitHub token scopes (not a classic PAT?)")
+            else:
+                print(f"  [OK] GitHub token scopes: {scopes}")
+                for scope in missing_github_scopes(scopes, required_scopes or {}):
+                    print(f"  [WARN] GitHub token lacks the '{scope}' scope, needed for "
+                          f"{(required_scopes or {})[scope]} - those steps will fail")
         elif r.status_code == 401:
             errors.append("GitHub token is invalid or expired")
             print("  [FAIL] GitHub token authentication failed")
@@ -3009,25 +3742,22 @@ def validate_credentials(
         print(f"  [FAIL] GitHub API connection error: {str(exc)[:80]}")
 
     if check_veracode and veracode_api_id and veracode_api_key:
-        try:
-            r = veracode_request(
-                "GET", "/srcclr/v3/workspaces", veracode_api_id, veracode_api_key,
-                params={"size": 1, "page": 0},
+        _probe_veracode("Veracode credentials", "/srcclr/v3/workspaces",
+                        veracode_api_id, veracode_api_key, errors, params={"size": 1, "page": 0})
+        if check_teams_api:
+            _probe_veracode(
+                "Veracode credentials (Identity API teams)", "/api/authn/v2/teams",
+                veracode_api_id, veracode_api_key, errors, params={"size": 1},
+                forbidden_msg="VERACODE_API_ID/KEY cannot list teams (HTTP 403): --create-teams "
+                              "needs an API account with the Administrator role",
             )
-            if r.status_code == 200:
-                print("  [OK] Veracode credentials valid")
-            elif r.status_code == 401:
-                errors.append("Veracode credentials are invalid")
-                print("  [FAIL] Veracode authentication failed")
-            elif r.status_code == 403:
-                errors.append("Veracode credentials lack required permissions")
-                print("  [FAIL] Veracode permission denied")
-            else:
-                errors.append(f"Veracode API returned unexpected status: {r.status_code}")
-                print(f"  [FAIL] Veracode API error: {r.status_code}")
-        except Exception as exc:
-            errors.append(f"Veracode API connection failed: {str(exc)[:100]}")
-            print(f"  [FAIL] Veracode API connection error: {str(exc)[:80]}")
+
+    if veracode_sa_api_id and veracode_sa_api_key:
+        # 401 = wrong id/key (fatal). A 403 only means this account's roles do
+        # not cover the probe, which says nothing about scan permissions.
+        _probe_veracode("Veracode service account credentials (VERACODE_SA_API_*)",
+                        "/api/authn/v2/users/self", veracode_sa_api_id, veracode_sa_api_key, errors,
+                        forbidden_is_error=False)
 
     if errors:
         print(f"\n[VALIDATION] Failed with {len(errors)} error(s)")
@@ -3158,9 +3888,9 @@ def process_org(
                 ya = health.veracode_yml_action
                 if ya in ("created", "updated_with_backup"):
                     ctx.stats.yml_updated += 1
-                elif ya == "present_no_update":
+                elif ya in ("present_no_update", "already_current"):
                     ctx.stats.yml_skipped += 1
-                elif ya.startswith("failed") or ya.startswith("put_failed") or ya.startswith("get_failed"):
+                elif ya.startswith(("failed", "put_failed", "get_failed", "backup_failed", "invalid_yaml")):
                     ctx.stats.yml_failed += 1
 
                 ra = health.reimport_action
@@ -3295,14 +4025,15 @@ def process_org(
         allow = check_actions_allowlist(ctx.api_base, org, ctx.token)
         entry["actions_allowlist"] = allow
         status = allow["status"]
+        blocking = ("local_only", "selected_missing", "actions_disabled", "repo_not_enabled")
         with ctx.stats_lock:
             if status in ("all_allowed", "selected_ok"):
                 ctx.stats.actions_allowed += 1
             elif status == "no_permission":
                 ctx.stats.actions_no_permission += 1
-            elif status in ("local_only", "selected_missing"):
+            elif status in blocking:
                 ctx.stats.actions_missing += 1
-        if status in ("local_only", "selected_missing"):
+        if status in blocking:
             missing = allow.get("missing", [])
             preview = ", ".join(missing[:4]) + (f" (+{len(missing) - 4} more)" if len(missing) > 4 else "")
             buf.add(f"  [WARNING] Actions allowlist incomplete - integration will break: {allow['detail']}")
@@ -3326,7 +4057,9 @@ def process_org(
             )
             entry["veracode_yml_update"] = {"success": yml_ok, "action": yml_action}
             with ctx.stats_lock:
-                if yml_ok:
+                if yml_ok and yml_action == "already_current":
+                    ctx.stats.yml_skipped += 1
+                elif yml_ok:
                     ctx.stats.yml_updated += 1
                 elif yml_action in ("repo_not_found", "repo_empty"):
                     ctx.stats.yml_skipped += 1
@@ -3376,10 +4109,19 @@ def process_org(
                     with ctx.stats_lock:
                         ctx.stats.secrets_fail += 1
                 else:
-                    agent_token = create_veracode_agent_token(
+                    # Fetch the org public key BEFORE rotating the agent token:
+                    # token:regenerate invalidates the live token, so it must only
+                    # run when the new one can actually be written as a secret.
+                    key_info = get_org_public_key(ctx.api_base, org, ctx.token, buf.add)
+                    agent_token = None if not key_info else create_veracode_agent_token(
                         workspace_id, org, ctx.veracode_api_id, ctx.veracode_api_key, log=buf.add,
                     )
-                    if not agent_token:
+                    if not key_info:
+                        entry["secrets"] = {"status": "error", "error": "Could not fetch org Actions public key "
+                                            "(admin:org?) - agent token not rotated"}
+                        with ctx.stats_lock:
+                            ctx.stats.secrets_fail += 1
+                    elif not agent_token:
                         entry["secrets"] = {"status": "error", "error": "Failed to generate agent token"}
                         with ctx.stats_lock:
                             ctx.stats.secrets_fail += 1
@@ -3387,7 +4129,7 @@ def process_org(
                         ok, set_results = set_veracode_secrets(
                             ctx.api_base, org, ctx.token,
                             ctx.veracode_sa_api_id, ctx.veracode_sa_api_key, agent_token,
-                            log=buf.add,
+                            log=buf.add, key_info=key_info, visibility=ctx.secret_visibility,
                         )
                         entry["secrets"] = {"status": "set" if ok else "partial", "results": set_results}
                         with ctx.stats_lock:
@@ -3446,23 +4188,11 @@ def process_org(
     with ctx.stats_lock:
         ctx.stats.processed += 1
 
-    with ctx.checkpoint_lock:
-        ctx.completed_orgs.append(org)
-        try:
-            ctx.checkpoint_file.write_text(
-                json.dumps(
-                    {
-                        "last_org": org,
-                        "processed": len(ctx.completed_orgs),
-                        "completed": ctx.completed_orgs,
-                    },
-                    indent=2,
-                ),
-                encoding="utf-8",
-                newline="\n",
-            )
-        except Exception as exc:
-            buf.add(f"  [WARNING] Failed to save checkpoint: {exc}")
+    org_failed = entry_failed(entry)
+    if org_failed:
+        with ctx.stats_lock:
+            ctx.stats.orgs_failed += 1
+    record_org_result(ctx, org, org_failed, log=buf.add)
 
     # --- Console summary line -------------------------------------------------
     if ctx.do_fix_repos:
@@ -3582,6 +4312,10 @@ def main() -> None:
     ap.add_argument("--set-secrets", action="store_true",
                     help="[apply] Set VERACODE_API_ID, VERACODE_API_KEY, VERACODE_AGENT_TOKEN. "
                          "Always overwrites - safe to re-run for credential rotation.")
+    ap.add_argument("--secret-visibility", choices=SECRET_VISIBILITIES, default="selected",
+                    help="Which repos can read the org secrets set by --set-secrets "
+                         "(default: selected = only the org's 'veracode' repo; falls back to "
+                         "private if that repo is missing).")
 
     ap.add_argument(
         "--update-veracode-yml", metavar="FILE", nargs="?", const="",
@@ -3589,6 +4323,14 @@ def main() -> None:
             "[apply] Push a veracode.yml to the 'veracode' repo in every org, overwriting the "
             "current file. Omit FILE to fetch from upstream; pass a local FILE path for custom. "
             "The current file is backed up as default-veracode.yml before overwriting."
+        ),
+    )
+    ap.add_argument(
+        "--upstream-ref", metavar="REF", default=None,
+        help=(
+            "Upstream branch or tag used when --update-veracode-yml has no FILE. Default: the latest "
+            "release tag of veracode/github-actions-integration ('latest'); 'main' is allowed. "
+            "--import-repo still mirrors the whole upstream repo."
         ),
     )
 
@@ -3617,7 +4359,12 @@ def main() -> None:
                     help="Environment variable holding the GitHub PAT (default: GITHUB_TOKEN).")
     ap.add_argument("--skip-to", help="Skip all orgs before this one and start from here.")
     ap.add_argument("--continue", dest="resume", action="store_true",
-                    help="Resume from the last checkpoint saved in checkpoint.json.")
+                    help="Resume from checkpoint.json: skip orgs that completed and retry orgs that failed. "
+                         "Only a checkpoint written by a run with the same mode (--apply/--dry-run) and "
+                         "action flags is used; otherwise the run starts from the beginning.")
+    ap.add_argument("--yes", action="store_true",
+                    help="[apply] Do not ask for confirmation. Without it, --apply asks unless "
+                         "--continue resumes from a matching checkpoint.")
     ap.add_argument("--workers", type=int, default=1, metavar="N",
                     help="Number of parallel worker threads (default: 1). Recommended: 3-5.")
     args = ap.parse_args()
@@ -3695,13 +4442,16 @@ def main() -> None:
             yml_content = local_path.read_text(encoding="utf-8")
             yml_source_label = str(local_path.resolve())
         elif do_update_yml:
-            print("[update-veracode-yml] Fetching veracode.yml from upstream integration repo...")
-            yml_content = fetch_upstream_veracode_yml()
+            upstream_ref = resolve_upstream_ref(args.upstream_ref)
+            if not upstream_ref:
+                sys.exit(1)
+            print(f"[update-veracode-yml] Fetching veracode.yml from upstream integration repo @ {upstream_ref}...")
+            yml_content = fetch_upstream_veracode_yml(upstream_ref)
             if not yml_content:
                 print("ERROR: Could not fetch veracode.yml from upstream repo. "
                       "Pass a local file with --update-veracode-yml FILE.", file=sys.stderr)
                 sys.exit(1)
-            yml_source_label = INTEGRATION_SOURCE_URL
+            yml_source_label = f"{INTEGRATION_SOURCE_URL} @ {upstream_ref}"
         if yml_source_label:
             print(f"[update-veracode-yml] Source: {yml_source_label}")
 
@@ -3836,6 +4586,13 @@ def main() -> None:
         veracode_api_id=veracode_api_id,
         veracode_api_key=veracode_api_key,
         check_veracode=do_set_secrets or do_create_teams or do_link_teams,
+        veracode_sa_api_id=veracode_sa_api_id if do_set_secrets else None,
+        veracode_sa_api_key=veracode_sa_api_key if do_set_secrets else None,
+        check_teams_api=do_create_teams,
+        required_scopes=required_github_scopes(
+            enterprise=bool(args.enterprise),
+            writes_workflows=bool(args.apply and (do_apply_repo or do_set_teams or do_fix_repos)),
+        ),
     )
     if not validation_ok:
         print("\n[ERROR] Credential validation failed:", file=sys.stderr)
@@ -3846,23 +4603,28 @@ def main() -> None:
 
     checkpoint_file = outdir / "checkpoint.json"
     start_index = 0
+    run_actions = [name for name, on in (
+        ("import-repo", do_apply_repo), ("set-secrets", do_set_secrets),
+        (f"set-teams-{teams_mode}", teams_mode != "none" and (do_set_teams or do_fix_repos)),
+        ("team-prefix=" + args.team_prefix, bool(args.team_prefix)),
+        ("skip-iac-rbac", bool(args.skip_iac_rbac)), ("update-veracode-yml", do_update_yml),
+        ("create-teams", do_create_teams), ("link-teams-to-workspaces", do_link_teams),
+        ("fix-repos", do_fix_repos),
+        ("secret-visibility=" + args.secret_visibility, do_set_secrets),
+        ("upstream-ref=" + str(args.upstream_ref), do_update_yml or do_fix_repos),
+    ) if on]
+    checkpoint_meta = checkpoint_meta_for(bool(args.apply), run_actions)
+    resumed: tuple[list[str], list[str]] | None = None
 
-    if args.resume and checkpoint_file.exists():
-        try:
-            checkpoint_data = json.loads(checkpoint_file.read_text(encoding="utf-8"))
-            completed_set = set(checkpoint_data.get("completed", []))
-            last_org = checkpoint_data.get("last_org")
-
-            if completed_set:
-                before = len(orgs)
-                orgs = [o for o in orgs if o not in completed_set]
-                skipped = before - len(orgs)
-                print(f"[RESUME] Skipping {skipped} already-completed orgs (parallel checkpoint)\n")
-            elif last_org and last_org in orgs:
-                start_index = orgs.index(last_org)
-                print(f"[RESUME] Restarting from: {last_org}  (skipping {start_index} orgs)\n")
-        except Exception as exc:
-            print(f"[WARNING] Failed to load checkpoint: {exc}")
+    if args.resume:
+        resumed = load_checkpoint(checkpoint_file, checkpoint_meta)
+        if resumed is not None:
+            completed_set = set(resumed[0])
+            retry = [o for o in orgs if o in set(resumed[1])]
+            before = len(orgs)
+            orgs = [o for o in orgs if o not in completed_set]
+            print(f"[RESUME] Skipping {before - len(orgs)} already-completed orgs; "
+                  f"retrying {len(retry)} that failed last time\n")
 
     if args.skip_to:
         if args.skip_to in orgs:
@@ -3877,7 +4639,7 @@ def main() -> None:
 
     total_orgs = len(orgs)
 
-    if args.apply and not args.resume:
+    if args.apply and resumed is None and not args.yes:
         print(f"\n{'=' * 60}")
         print("   CONFIRMATION REQUIRED")
         print(f"{'=' * 60}")
@@ -3936,8 +4698,13 @@ def main() -> None:
         report_path=report_path,
         checkpoint_file=checkpoint_file,
         do_iac_rbac=not args.skip_iac_rbac,
+        secret_visibility=args.secret_visibility,
         stats=RunStats(total_orgs=total_orgs),
     )
+    # Seed from the checkpoint so a resumed run keeps the earlier runs' progress.
+    ctx.checkpoint_meta = checkpoint_meta
+    if resumed is not None:
+        ctx.completed_orgs, ctx.failed_orgs = list(resumed[0]), list(resumed[1])
 
     workers = args.workers
 
@@ -3952,6 +4719,7 @@ def main() -> None:
             print(f"[WARNING] Pre-clone failed ({clone_msg}) - will clone per org\n")
             _cached_clone_dir = None
 
+    interrupted = False
     try:
         if workers > 1:
             print(f"[PARALLEL] Running with {workers} workers\n")
@@ -3998,6 +4766,9 @@ def main() -> None:
                             future.result()
                         except Exception as exc:
                             tprint(f"[ERROR] Unhandled exception for org {org_name}: {exc}")
+                            with ctx.stats_lock:
+                                ctx.stats.orgs_raised += 1
+                            record_org_result(ctx, org_name, failed=True)
                         if slot_id is not None:
                             org_buf.flush_then_clear(progress, slot_id)
                         else:
@@ -4006,12 +4777,22 @@ def main() -> None:
                 progress.stop()
         else:
             for idx, org in enumerate(orgs, 1):
-                process_org(org, idx, ctx, _cached_clone_dir)
+                try:
+                    process_org(org, idx, ctx, _cached_clone_dir)
+                except Exception as exc:  # one broken org must not stop the run
+                    tprint(f"[ERROR] Unhandled exception for org {org}: {exc}")
+                    with ctx.stats_lock:
+                        ctx.stats.orgs_raised += 1
+                    record_org_result(ctx, org, failed=True)
+    except KeyboardInterrupt:
+        interrupted = True
+        print("\n[INTERRUPTED] Stopping. Progress is saved in checkpoint.json; "
+              "re-run with the same flags plus --continue to resume.", file=sys.stderr)
     finally:
         if _cached_clone_dir and os.path.exists(_cached_clone_dir):
             shutil.rmtree(_cached_clone_dir, ignore_errors=True)
-
-    finalize_report(report_path)
+        # Always turn the JSONL report into a JSON array, even on interrupt/crash.
+        finalize_report(report_path)
 
     write_csv(outdir / "missing_veracode_repo.csv", ["organization", "repo_name", "note"], ctx.missing_repo_rows)
     write_csv(outdir / "missing_workflow_app.csv", ["organization", "app_slug", "note"], ctx.missing_app_rows)
@@ -4116,7 +4897,15 @@ def main() -> None:
               f"{len(ctx.missing_app_rows)} org(s) need app installation")
         print("    See CSV files above for details and actions needed.")
 
-    sys.exit(0)
+    failures = run_failure_count(st, do_apply_repo)
+    if interrupted:
+        print(f"\n[INTERRUPTED] Exit code {EXIT_INTERRUPTED}. Resume with --continue.")
+        sys.exit(EXIT_INTERRUPTED)
+    if failures:
+        print(f"\n[FAILED] {failures} failed step(s); {st.orgs_failed + st.orgs_raised} org(s) recorded as failed "
+              f"in checkpoint.json (retried by --continue). Exit code {EXIT_FAILURES}.")
+        sys.exit(EXIT_FAILURES)
+    sys.exit(EXIT_OK)
 
 
 if __name__ == "__main__":

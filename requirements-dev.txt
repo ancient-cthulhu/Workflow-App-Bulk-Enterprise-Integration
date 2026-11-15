@@ -1,0 +1,4 @@
+-r requirements.txt
+pytest>=8
+PyYAML>=6.0
+ruff>=0.6
