@@ -17,13 +17,14 @@ Step-by-step guides: [enterprise onboarding](onboarding-guide/enterprise-onboard
 |`pip install PyYAML`|Always (edited workflows and `veracode.yml` are parsed before they are written)|
 |`pip install veracode-api-signing`|`--create-teams`, `--set-secrets`, `--link-teams-to-workspaces`|
 |`pip install pynacl`|`--set-secrets` (checked at startup)|
+|`pip install "PyJWT[crypto]"`|GitHub App auth (`GITHUB_APP_ID` / `GITHUB_APP_PRIVATE_KEY`)|
 |`git` on `PATH`|`--import-repo`, and `--fix-repos` when it re-imports a broken repo|
 |`veracode.yml` next to `script.py`|`--import-repo` (onboarding config; without it the repo is imported but the file is skipped) and `--fix-repos`|
 |GitHub org owner rights|Installing the workflow app, org secrets, Actions policy|
 |Veracode Administrator account|Veracode API flags (see [Credentials](#credentials))|
 
 ```bash
-pip install requests PyYAML veracode-api-signing pynacl
+pip install requests PyYAML veracode-api-signing pynacl "PyJWT[crypto]"
 # or: pip install -r requirements.txt
 ```
 
@@ -79,7 +80,8 @@ An import that finished after a timeout is detected on the next run (no `default
 
 |Variable|Used for|Account|
 |---|---|---|
-|`GITHUB_TOKEN`|All GitHub calls. Use `--token-env NAME` to read another variable.|Classic PAT, see [GitHub token](#github-token)|
+|`GITHUB_APP_ID` / `GITHUB_APP_PRIVATE_KEY`|All GitHub calls, with a token minted per org|GitHub App, see [GitHub App](#github-app)|
+|`GITHUB_TOKEN`|Fallback when the App variables are not set. Use `--token-env NAME` to read another variable.|Classic PAT, see [GitHub token](#github-token)|
 |`VERACODE_API_ID` / `VERACODE_API_KEY`|Script calls to Veracode APIs: teams, workspaces, agent tokens, links. Never stored in GitHub.|**Human user** with the **Administrator** role|
 |`VERACODE_SA_API_ID` / `VERACODE_SA_API_KEY`|Stored as `VERACODE_API_ID` / `VERACODE_API_KEY` org secrets and used by workflows at scan time|API service account|
 
@@ -96,9 +98,30 @@ The admin pair must be a human Administrator account: SCA workspace and agent-to
 
 -----
 
+## GitHub App
+
+```bash
+export GITHUB_APP_ID=123456
+export GITHUB_APP_PRIVATE_KEY="$(cat app.private-key.pem)"
+```
+
+`GITHUB_APP_PRIVATE_KEY` takes the PEM text, the PEM on one line with `\n`, or a path to the `.pem` file. The script signs a JWT, looks up each org's installation (`GET /orgs/{org}/installation`), mints a 1-hour installation token per org and caches it, renewing 10 minutes before expiry. Orgs where the App is not installed (or suspended) are reported and skipped; the run continues. Needs `pip install "PyJWT[crypto]"`. Without `--orgs-file`, every org the App is installed on is processed. `--enterprise` discovery needs a PAT (`read:enterprise`) and is refused in App mode. An org without the App gets a `github_app_auth` entry in the report and is retried by `--continue`. Install the App on **All repositories** so it can reach the `veracode` repo it creates.
+
+|Permission|Access|Needed for|
+|---|---|---|
+|Administration (repository)|Read and write|create the `veracode` repo, set its default branch|
+|Contents|Read and write|`veracode.yml`, repo contents, mirror push|
+|Workflows|Read and write|`.github/workflows/*` (teams, IaC RBAC, import, `--fix-repos`)|
+|Administration (organization)|Read|Workflow App installation check, Actions policy|
+|Secrets (organization)|Read and write|`--set-secrets` (read for the status check)|
+
+Startup validation checks these against the App's configured permissions and warns about gaps.
+
+-----
+
 ## GitHub Token
 
-Use a **classic personal access token**. The token's user must be an **owner** of each org.
+Fallback when the App variables are not set. Use a **classic personal access token**. The token's user must be an **owner** of each org.
 
 |Scope|Needed for|Endpoints|
 |---|---|---|

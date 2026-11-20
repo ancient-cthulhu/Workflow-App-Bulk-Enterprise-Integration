@@ -5,6 +5,7 @@ import copy
 import csv
 import fnmatch
 import functools
+import http.client
 import json
 import os
 import random
@@ -15,6 +16,9 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from base64 import b64decode, b64encode
 from collections import deque
 from collections.abc import Callable, Iterator
@@ -522,8 +526,267 @@ def run_failure_count(stats: RunStats, import_requested: bool) -> int:
 
 
 # ---------------------------------------------------------------------------
+# GitHub App auth: one installation token per org, minted on demand and cached
+# ---------------------------------------------------------------------------
+class AppAuthError(RuntimeError):
+    """The GitHub App could not get a token (bad key/ID, suspended, API error)."""
+
+
+class AppNotInstalledError(AppAuthError):
+    """The GitHub App is not installed on the org."""
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None  # never forward the JWT/token; a 3xx surfaces as HTTPError
+
+
+def _load_app_private_key(value: str) -> str:
+    """PEM text, a one-line PEM with literal \\n (common in .env files), or a path to a .pem file."""
+    text = value.strip()
+    if "-----BEGIN" not in text:
+        path = Path(text).expanduser()
+        if not path.is_file():
+            raise AppAuthError("GITHUB_APP_PRIVATE_KEY must be a PEM private key or the path to a .pem file")
+        text = path.read_text(encoding="utf-8").strip()
+    if "\\n" in text and "\n" not in text:
+        text = text.replace("\\n", "\n")
+    return text + "\n"
+
+
+class GitHubAppAuth:
+    """Installation tokens for a GitHub App installed on many orgs.
+
+    JWT (RS256) -> GET /orgs/{org}/installation -> POST
+    /app/installations/{id}/access_tokens. Tokens are cached per org and
+    re-minted REFRESH_MARGIN seconds before their 1h expiry. Thread-safe.
+    """
+
+    REFRESH_MARGIN = 600  # renew 10 min early so a long git push or paginated read never outlives the token
+    JWT_TTL = 540  # GitHub rejects app JWTs that live longer than 10 min
+    TIMEOUT = 30
+
+    def __init__(self, app_id: str, private_key: str, api_base: str, user_agent: str = "github-app-auth"):
+        self.app_id = str(app_id).strip()
+        self.private_key = private_key
+        self.api_base = api_base.rstrip("/")
+        self.user_agent = user_agent
+        self._lock = threading.Lock()
+        self._org_locks: dict = {}
+        self._jwt: tuple = ("", 0.0)
+        self._installation_ids: dict = {}  # org.lower() -> installation id
+        self._tokens: dict = {}  # org.lower() -> (token, expires_at epoch, permissions dict)
+        self._not_installed: dict = {}  # org.lower() -> error message, so a missing org costs one lookup
+        self._app: dict = {}
+        self._opener = urllib.request.build_opener(_NoRedirect())
+
+    @classmethod
+    def from_env(cls, api_base: str, user_agent: str = "github-app-auth") -> "GitHubAppAuth | None":
+        """None when neither GITHUB_APP_ID nor GITHUB_APP_PRIVATE_KEY is set (PAT fallback)."""
+        app_id = (os.environ.get("GITHUB_APP_ID") or "").strip()
+        key = os.environ.get("GITHUB_APP_PRIVATE_KEY") or ""
+        if not app_id and not key.strip():
+            return None
+        if not app_id or not key.strip():
+            raise AppAuthError("set both GITHUB_APP_ID and GITHUB_APP_PRIVATE_KEY")
+        auth = cls(app_id, _load_app_private_key(key), api_base, user_agent)
+        auth.jwt()  # fail fast on a bad key or a missing PyJWT
+        return auth
+
+    # -- JWT --------------------------------------------------------------- #
+    def jwt(self) -> str:
+        with self._lock:
+            token, exp = self._jwt
+            if token and exp - time.time() > 60:
+                return token
+            try:
+                import jwt as pyjwt
+            except ImportError:
+                raise AppAuthError("GitHub App auth needs PyJWT with crypto: pip install 'PyJWT[crypto]'") from None
+            now = int(time.time())
+            payload = {"iat": now - 60, "exp": now + self.JWT_TTL, "iss": self.app_id}  # iat back-dated for clock skew
+            try:
+                token = pyjwt.encode(payload, self.private_key, algorithm="RS256")
+            except Exception as e:  # bad PEM, wrong key type
+                raise AppAuthError(f"cannot sign the GitHub App JWT: {type(e).__name__}") from None
+            token = token.decode() if isinstance(token, bytes) else token
+            self._jwt = (token, float(now + self.JWT_TTL))
+            return token
+
+    # -- HTTP -------------------------------------------------------------- #
+    def _call(self, method: str, path: str, bearer: str | None, ok404: bool = False):
+        url = path if path.startswith(("https://", "http://")) else self.api_base + path
+        if not url.startswith(self.api_base + "/"):
+            raise AppAuthError(f"refusing to send credentials outside {self.api_base}")
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": self.user_agent,
+        }
+        if bearer:
+            headers["Authorization"] = f"Bearer {bearer}"
+        for attempt in range(4):
+            req = urllib.request.Request(url, data=b"" if method == "POST" else None, method=method, headers=headers)
+            try:
+                with self._opener.open(req, timeout=self.TIMEOUT) as resp:
+                    raw = resp.read()
+                    return (json.loads(raw) if raw else None), resp.headers
+            except urllib.error.HTTPError as e:
+                status, hdrs, raw = e.code, e.headers, e.read()
+            except (OSError, http.client.HTTPException) as e:
+                if attempt == 3:
+                    raise AppAuthError(f"{method} {path}: network error: {e}") from None
+                time.sleep(2**attempt)
+                continue
+            if status == 404 and ok404:
+                return None, hdrs
+            retry_after = (hdrs.get("Retry-After") or "").strip()
+            limited = status == 429 or (status == 403 and (retry_after or hdrs.get("X-RateLimit-Remaining") == "0"))
+            if attempt < 3 and (status >= 500 or limited):
+                wait = int(retry_after) if retry_after.isdigit() else 2**attempt
+                if hdrs.get("X-RateLimit-Remaining") == "0" and (hdrs.get("X-RateLimit-Reset") or "").isdigit():
+                    wait = int(hdrs["X-RateLimit-Reset"]) - int(time.time()) + 1
+                time.sleep(min(max(wait, 1), 300))
+                continue
+            try:
+                msg = json.loads(raw).get("message", "")
+            except (ValueError, AttributeError):
+                msg = raw[:200].decode(errors="replace")
+            raise AppAuthError(f"{method} {path}: HTTP {status} {msg}".rstrip())
+        raise AppAuthError(f"{method} {path}: gave up after retries")
+
+    def _org_lock(self, key: str) -> threading.Lock:
+        with self._lock:
+            return self._org_locks.setdefault(key, threading.Lock())
+
+    # -- App / installations ----------------------------------------------- #
+    def app(self) -> dict:
+        """GET /app: validates the App ID and key; slug and html_url for messages."""
+        if not self._app:
+            try:
+                self._app = self._call("GET", "/app", self.jwt())[0] or {}
+            except AppAuthError as e:
+                if "HTTP 401" in str(e) or "HTTP 404" in str(e):  # GitHub: "Integration not found"
+                    raise AppAuthError(f"{e} (check GITHUB_APP_ID matches the private key, and the clock)") from None
+                raise
+        return self._app
+
+    def installation_id(self, org: str) -> int:
+        key = org.lower()
+        if key in self._not_installed:
+            raise AppNotInstalledError(self._not_installed[key])
+        if key not in self._installation_ids:
+            data, _ = self._call("GET", f"/orgs/{urllib.parse.quote(org)}/installation", self.jwt(), ok404=True)
+            if not data or not data.get("id"):
+                self.app()  # a wrong App ID also 404s here: report that, not "not installed"
+                self._not_installed[key] = (
+                    f"GitHub App {self.app_id} is not installed on org '{org}'; install it on the org "
+                    f"({self._app.get('html_url') or 'App settings'}/installations/new) and re-run"
+                )
+                raise AppNotInstalledError(self._not_installed[key])
+            if data.get("suspended_at"):
+                self._not_installed[key] = f"GitHub App {self.app_id} installation on org '{org}' is suspended"
+                raise AppNotInstalledError(self._not_installed[key])
+            self._installation_ids[key] = int(data["id"])
+        return self._installation_ids[key]
+
+    def installed_orgs(self) -> list:
+        """Logins of every org the App is installed on (not suspended), for 'all orgs' runs."""
+        orgs, url = [], "/app/installations?per_page=100"
+        while url:
+            data, hdrs = self._call("GET", url, self.jwt())
+            for inst in data or []:
+                account = inst.get("account") or {}
+                if inst.get("target_type") == "Organization" and not inst.get("suspended_at") and account.get("login"):
+                    orgs.append(account["login"])
+                    self._installation_ids[account["login"].lower()] = int(inst["id"])
+            m = re.search(r'<([^>]+)>;\s*rel="next"', hdrs.get("Link") or "")
+            url = m.group(1) if m else ""
+        return orgs
+
+    # -- Installation tokens ----------------------------------------------- #
+    def _cached(self, key: str):
+        entry = self._tokens.get(key)
+        return entry if entry and entry[1] - time.time() > self.REFRESH_MARGIN else None
+
+    def token(self, org: str) -> str:
+        """A valid installation token (ghs_...) for org, minted at most once per ~50 min."""
+        return self._entry(org)[0]
+
+    def permissions(self, org: str) -> dict:
+        """Permissions granted to the org's token, e.g. {'contents': 'write', 'workflows': 'write'}."""
+        return dict(self._entry(org)[2])
+
+    def _entry(self, org: str):
+        key = org.lower()
+        entry = self._cached(key)
+        if entry:
+            return entry
+        with self._org_lock(key):  # one mint per org even with many worker threads
+            entry = self._cached(key)
+            if entry:
+                return entry
+            for attempt in (0, 1):
+                inst = self.installation_id(org)
+                try:
+                    data, _ = self._call("POST", f"/app/installations/{inst}/access_tokens", self.jwt())
+                    break
+                except AppAuthError as e:
+                    if attempt == 0 and "HTTP 404" in str(e):  # uninstalled and maybe reinstalled since lookup
+                        self._installation_ids.pop(key, None)
+                        continue
+                    raise AppAuthError(f"cannot mint a token for org '{org}': {e}") from None
+            token = (data or {}).get("token")
+            if not token:
+                raise AppAuthError(f"cannot mint a token for org '{org}': no token in the response")
+            try:
+                expires = self._epoch((data or {}).get("expires_at"))
+            except (TypeError, ValueError):
+                expires = time.time() + 3600
+            entry = (token, expires, (data or {}).get("permissions") or {})
+            self._tokens[key] = entry
+            return entry
+
+    def invalidate(self, org: str) -> None:
+        """Drop the cached token after a 401 so the next call mints a new one."""
+        self._tokens.pop(org.lower(), None)
+
+    def bot_identity(self, token: str | None = None) -> tuple:
+        """(login, noreply email) of the App's bot user, for commit authorship.
+        Pass an installation token where anonymous API reads are disabled (GHES private mode)."""
+        slug = self.app().get("slug") or ""
+        if not slug:
+            raise AppAuthError("GET /app returned no slug")
+        login = f"{slug}[bot]"
+        data, _ = self._call("GET", f"/users/{urllib.parse.quote(login)}", token, ok404=True)
+        if not data or not data.get("id"):
+            raise AppAuthError(f"cannot look up the bot user {login}")
+        return login, f"{data['id']}+{login}@users.noreply.github.com"
+
+    @staticmethod
+    def _epoch(value) -> float:
+        """Epoch seconds from GitHub's ISO-8601 timestamp ('2026-01-01T00:00:00Z')."""
+        from datetime import datetime as _datetime
+
+        return _datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+
+
+# ---------------------------------------------------------------------------
 # Shared run context
 # ---------------------------------------------------------------------------
+
+class AppToken(str):
+    """An org's installation token that can re-read the cache, so a request retried after a
+    long rate-limit wait (up to the hourly reset) never goes out with an expired token."""
+
+    def __new__(cls, value: str, app: GitHubAppAuth, org: str) -> AppToken:
+        obj = super().__new__(cls, value)
+        obj.app, obj.org = app, org
+        return obj
+
+    def fresh(self) -> str:
+        return self.app.token(self.org)
+
 
 @dataclass
 class RunContext:
@@ -552,6 +815,7 @@ class RunContext:
     checkpoint_file: Path
     do_iac_rbac: bool = True
     secret_visibility: str = "selected"
+    app: GitHubAppAuth | None = None  # App mode: every org call uses that org's installation token
     stats: RunStats = field(default_factory=RunStats)
     stats_lock: threading.Lock = field(default_factory=threading.Lock)
     rows_lock: threading.Lock = field(default_factory=threading.Lock)
@@ -564,6 +828,13 @@ class RunContext:
     completed_orgs: list[str] = field(default_factory=list)
     failed_orgs: list[str] = field(default_factory=list)
     checkpoint_meta: dict[str, Any] = field(default_factory=dict)
+
+    def token_for(self, org: str) -> str:
+        """The PAT, or org's installation token (cached; re-minted before its 1h expiry).
+        Fetched per step so a long org run never uses an expired token."""
+        if self.app is None:
+            return self.token
+        return AppToken(self.app.token(org), self.app, org)
 
     def __post_init__(self) -> None:
         if self.do_set_secrets:
@@ -861,10 +1132,9 @@ def request(
     accounting, and skips check_rate_limit (its headers are GraphQL-bucket
     values, not REST primary).
     """
-    headers = gh_headers(token)
-
     def make() -> requests.Response:
         _rate_limiter.acquire(method, graphql=graphql)
+        headers = gh_headers(token.fresh() if isinstance(token, AppToken) else token)
         try:
             r = _session().request(method, url, headers=headers, timeout=45, **kwargs)
         finally:
@@ -3231,6 +3501,27 @@ def list_orgs_graphql(
     return all_orgs or None
 
 
+def list_orgs_for_app(app: GitHubAppAuth, orgs_file: str | None) -> list[str]:
+    """GitHub App mode: the orgs in orgs_file, else every org the App is installed on."""
+    if orgs_file:
+        print(f"Reading orgs from file: {orgs_file}")
+        with open(orgs_file, encoding="utf-8") as f:
+            orgs = [ln.strip() for ln in f if ln.strip() and not ln.strip().startswith("#")]
+        if not orgs:
+            raise OrgDiscoveryError(f"File '{orgs_file}' contains no valid org names")
+        print(f"[OK] Found {len(orgs)} orgs from file")
+        return orgs
+    print("Discovering orgs via /app/installations (every org the GitHub App is installed on)")
+    try:
+        orgs = app.installed_orgs()
+    except AppAuthError as exc:
+        raise OrgDiscoveryError(f"Cannot list the GitHub App's installations: {exc}") from None
+    if not orgs:
+        raise OrgDiscoveryError("The GitHub App is not installed on any organization")
+    print(f"[OK] Found {len(orgs)} orgs with the GitHub App installed")
+    return orgs
+
+
 def list_orgs(api_base: str, token: str, enterprise: str | None, orgs_file: str | None) -> list[str]:
     errors: list[str] = []
 
@@ -3692,29 +3983,42 @@ def _probe_veracode(
         print(f"  [FAIL] {label}: connection error: {str(exc)[:80]}")
 
 
-def validate_credentials(
-    api_base: str,
-    token: str,
-    veracode_api_id: str | None,
-    veracode_api_key: str | None,
-    check_veracode: bool,
-    veracode_sa_api_id: str | None = None,
-    veracode_sa_api_key: str | None = None,
-    check_teams_api: bool = False,
-    required_scopes: dict[str, str] | None = None,
-) -> tuple[bool, list[str]]:
-    """Fail fast on bad credentials before touching any org.
+_PERMISSION_LEVEL = {"read": 1, "write": 2, "admin": 3}
 
-    - VERACODE_API_*: SCA workspaces probe (check_veracode); with
-      check_teams_api (--create-teams) also the Identity API teams list,
-      which needs the Administrator role.
-    - VERACODE_SA_API_* (when given, i.e. --set-secrets): Identity API
-      users/self, so invalid credentials are not written into every org.
-    - Classic PAT scopes (X-OAuth-Scopes) vs required_scopes: warning only.
-    """
-    errors: list[str] = []
-    print("\n[VALIDATION] Checking credentials...")
 
+def required_app_permissions(
+    *, writes_workflows: bool, sets_secrets: bool, creates_repo: bool,
+) -> dict[str, tuple[str, str]]:
+    """GitHub App permission -> (minimum level, what it is needed for). PAT scopes map to these."""
+    perms = {
+        "contents": ("write", "veracode.yml and the veracode repo contents"),
+        "organization_administration": ("read", "Workflow App installation check, Actions policy"),
+        "organization_secrets": ("write" if sets_secrets else "read", "org secrets"),
+    }
+    if writes_workflows:
+        perms["workflows"] = ("write", "writing .github/workflows/* in the veracode repo")
+    if creates_repo or writes_workflows:
+        perms["administration"] = ("write", "creating the veracode repo, setting its default branch")
+    return perms
+
+
+def _validate_github_app(app: GitHubAppAuth, required: dict[str, tuple[str, str]], errors: list[str]) -> None:
+    try:
+        info = app.app()
+    except AppAuthError as exc:
+        errors.append(f"GitHub App authentication failed: {exc}")
+        print("  [FAIL] GitHub App authentication failed (check GITHUB_APP_ID / GITHUB_APP_PRIVATE_KEY)")
+        return
+    print(f"  [OK] GitHub App valid (app: {info.get('slug') or app.app_id}); tokens are minted per org")
+    granted = info.get("permissions") or {}
+    for perm, (level, why) in required.items():
+        if _PERMISSION_LEVEL.get(granted.get(perm, ""), 0) < _PERMISSION_LEVEL[level]:
+            print(f"  [WARN] GitHub App lacks '{perm}: {level}', needed for {why} - those steps will fail")
+
+
+def _validate_github_token(
+    api_base: str, token: str, required_scopes: dict[str, str] | None, errors: list[str],
+) -> None:
     try:
         r = request("GET", f"{api_base}/user", token)
         if r.status_code == 200:
@@ -3740,6 +4044,37 @@ def validate_credentials(
     except Exception as exc:
         errors.append(f"GitHub API connection failed: {str(exc)[:100]}")
         print(f"  [FAIL] GitHub API connection error: {str(exc)[:80]}")
+
+
+def validate_credentials(
+    api_base: str,
+    token: str,
+    veracode_api_id: str | None,
+    veracode_api_key: str | None,
+    check_veracode: bool,
+    veracode_sa_api_id: str | None = None,
+    veracode_sa_api_key: str | None = None,
+    check_teams_api: bool = False,
+    required_scopes: dict[str, str] | None = None,
+    app: GitHubAppAuth | None = None,
+    required_app_permissions: dict[str, tuple[str, str]] | None = None,
+) -> tuple[bool, list[str]]:
+    """Fail fast on bad credentials before touching any org.
+
+    - VERACODE_API_*: SCA workspaces probe (check_veracode); with
+      check_teams_api (--create-teams) also the Identity API teams list,
+      which needs the Administrator role.
+    - VERACODE_SA_API_* (when given, i.e. --set-secrets): Identity API
+      users/self, so invalid credentials are not written into every org.
+    - Classic PAT scopes (X-OAuth-Scopes) vs required_scopes: warning only.
+    """
+    errors: list[str] = []
+    print("\n[VALIDATION] Checking credentials...")
+
+    if app is not None:
+        _validate_github_app(app, required_app_permissions or {}, errors)
+    else:
+        _validate_github_token(api_base, token, required_scopes, errors)
 
     if check_veracode and veracode_api_id and veracode_api_key:
         _probe_veracode("Veracode credentials", "/srcclr/v3/workspaces",
@@ -3808,6 +4143,21 @@ def process_org(
         "timestamp_readable": now.strftime("%Y-%m-%d %H:%M:%S %A"),
     }
 
+    if ctx.app is not None:
+        try:
+            ctx.app.token(org)  # a missing install is looked up once, then cached
+        except AppAuthError as exc:
+            status = "not_installed" if isinstance(exc, AppNotInstalledError) else "auth_failed"
+            entry["github_app_auth"] = {"status": status, "error": str(exc)}
+            buf.add(f"  [ERROR] {exc}")
+            with ctx.report_lock:
+                append_report_entry(ctx.report_path, entry)
+            with ctx.stats_lock:
+                ctx.stats.processed += 1
+                ctx.stats.orgs_failed += 1
+            record_org_result(ctx, org, True, log=buf.add)
+            return
+
     if ctx.do_set_teams or ctx.do_create_teams:
         if ctx.teams_mode == "auto":
             teams_value: str | None = org
@@ -3840,7 +4190,7 @@ def process_org(
                     fix_teams_value = ctx.team_prefix + fix_teams_value
 
             health = check_repo_health(
-                ctx.api_base, org, INTEGRATION_REPO_NAME, ctx.token,
+                ctx.api_base, org, INTEGRATION_REPO_NAME, ctx.token_for(org),
                 yml_content=ctx.yml_content,
                 teams_value=fix_teams_value,
                 onboarding_yml_content=ctx.onboarding_yml_content,
@@ -3909,7 +4259,7 @@ def process_org(
     if not ctx.do_fix_repos:
         try:
             repo_ok, repo_details = ensure_veracode_repo_imported(
-                ctx.api_base, org, ctx.token,
+                ctx.api_base, org, ctx.token_for(org),
                 do_apply=ctx.do_apply_repo,
                 onboarding_yml_content=ctx.onboarding_yml_content,
                 auto_import=ctx.do_apply_repo,
@@ -3968,12 +4318,12 @@ def process_org(
     if ctx.do_set_teams and teams_value and not ctx.do_fix_repos:
         try:
             if repo_confirmed_present or (
-                repo_exists(ctx.api_base, org, INTEGRATION_REPO_NAME, ctx.token) and
-                not repo_is_empty(ctx.api_base, org, INTEGRATION_REPO_NAME, ctx.token)
+                repo_exists(ctx.api_base, org, INTEGRATION_REPO_NAME, ctx.token_for(org)) and
+                not repo_is_empty(ctx.api_base, org, INTEGRATION_REPO_NAME, ctx.token_for(org))
             ):
                 file_actions: dict[str, str] = {}
                 teams_ok, teams_msg = inject_teams_into_workflows(
-                    ctx.api_base, org, INTEGRATION_REPO_NAME, ctx.token, teams_value,
+                    ctx.api_base, org, INTEGRATION_REPO_NAME, ctx.token_for(org), teams_value,
                     update_existing=True,
                     log=buf.add,
                     include_iac_rbac=ctx.do_iac_rbac,
@@ -4001,7 +4351,7 @@ def process_org(
 
     # --- App install check ----------------------------------------------------
     try:
-        app_ok, app_details = check_app_installed(ctx.api_base, ctx.web_base, org, ctx.token)
+        app_ok, app_details = check_app_installed(ctx.api_base, ctx.web_base, org, ctx.token_for(org))
         entry["workflow_app"] = {"installed": app_ok, **app_details}
         with ctx.stats_lock:
             if app_ok:
@@ -4022,7 +4372,7 @@ def process_org(
 
     # --- Actions allowlist prerequisite check (warn-only) ---------------------
     try:
-        allow = check_actions_allowlist(ctx.api_base, org, ctx.token)
+        allow = check_actions_allowlist(ctx.api_base, org, ctx.token_for(org))
         entry["actions_allowlist"] = allow
         status = allow["status"]
         blocking = ("local_only", "selected_missing", "actions_disabled", "repo_not_enabled")
@@ -4051,7 +4401,7 @@ def process_org(
     if ctx.do_update_yml and ctx.yml_content and not ctx.do_fix_repos:
         try:
             yml_ok, yml_action = update_veracode_yml_in_repo(
-                ctx.api_base, org, INTEGRATION_REPO_NAME, ctx.token, ctx.yml_content,
+                ctx.api_base, org, INTEGRATION_REPO_NAME, ctx.token_for(org), ctx.yml_content,
                 repo_is_known_present=repo_confirmed_present,
                 log=buf.add,
             )
@@ -4075,7 +4425,7 @@ def process_org(
     if ctx.dry_run or ctx.do_set_secrets:
         try:
             if ctx.dry_run:
-                results = check_veracode_secrets_status(ctx.api_base, org, ctx.token)
+                results = check_veracode_secrets_status(ctx.api_base, org, ctx.token_for(org))
                 counts = {
                     v: sum(1 for x in results.values() if x == v)
                     for v in ("no_permission", "missing", "exists", "error")
@@ -4112,7 +4462,7 @@ def process_org(
                     # Fetch the org public key BEFORE rotating the agent token:
                     # token:regenerate invalidates the live token, so it must only
                     # run when the new one can actually be written as a secret.
-                    key_info = get_org_public_key(ctx.api_base, org, ctx.token, buf.add)
+                    key_info = get_org_public_key(ctx.api_base, org, ctx.token_for(org), buf.add)
                     agent_token = None if not key_info else create_veracode_agent_token(
                         workspace_id, org, ctx.veracode_api_id, ctx.veracode_api_key, log=buf.add,
                     )
@@ -4127,7 +4477,7 @@ def process_org(
                             ctx.stats.secrets_fail += 1
                     else:
                         ok, set_results = set_veracode_secrets(
-                            ctx.api_base, org, ctx.token,
+                            ctx.api_base, org, ctx.token_for(org),
                             ctx.veracode_sa_api_id, ctx.veracode_sa_api_key, agent_token,
                             log=buf.add, key_info=key_info, visibility=ctx.secret_visibility,
                         )
@@ -4247,7 +4597,7 @@ def process_org(
         s = entry["secrets"]
         sec_status = s.get("status", "")
         if sec_status == "no_permission":
-            secrets_status = "  Secrets: [WARN] (no_permission - token needs admin:org scope)"
+            secrets_status = "  Secrets: [WARN] (no_permission - needs admin:org scope, or the App's Secrets org permission)"
         elif sec_status == "all_exist":
             secrets_status = "  Secrets: [OK] (all exist)"
         elif sec_status == "all_missing":
@@ -4356,7 +4706,8 @@ def main() -> None:
     ap.add_argument("--web-base", default=env("GITHUB_WEB_BASE", "https://github.com"),
                     help="GitHub web base URL (used for manual install links).")
     ap.add_argument("--token-env", default="GITHUB_TOKEN",
-                    help="Environment variable holding the GitHub PAT (default: GITHUB_TOKEN).")
+                    help="Environment variable holding a GitHub PAT, used only when GITHUB_APP_ID and "
+                         "GITHUB_APP_PRIVATE_KEY are not set (default: GITHUB_TOKEN).")
     ap.add_argument("--skip-to", help="Skip all orgs before this one and start from here.")
     ap.add_argument("--continue", dest="resume", action="store_true",
                     help="Resume from checkpoint.json: skip orgs that completed and retry orgs that failed. "
@@ -4392,13 +4743,22 @@ def main() -> None:
             print("ERROR: --set-secrets requires pynacl.  Install with: pip install pynacl", file=sys.stderr)
             sys.exit(1)
 
-    token = env(args.token_env)
-    if not token:
-        print(f"ERROR: Set {args.token_env} environment variable.", file=sys.stderr)
-        sys.exit(1)
-
     api_base = args.api_base.rstrip("/")
     web_base = args.web_base.rstrip("/")
+
+    try:
+        app = GitHubAppAuth.from_env(api_base, "veracode-workflow-rollout-helper")
+    except AppAuthError as exc:
+        print(f"ERROR: GitHub App auth: {exc}", file=sys.stderr)
+        sys.exit(1)
+    token = "" if app is not None else (env(args.token_env) or "")
+    if app is None and not token:
+        print(f"ERROR: Set GITHUB_APP_ID and GITHUB_APP_PRIVATE_KEY, or {args.token_env}.", file=sys.stderr)
+        sys.exit(1)
+    if app is not None and args.enterprise:
+        print("ERROR: --enterprise org discovery needs a PAT with read:enterprise. With a GitHub App, "
+              "pass --orgs-file, or omit both to target every org the App is installed on.", file=sys.stderr)
+        sys.exit(1)
 
     do_apply_repo = bool(args.apply and args.import_repo)
     do_set_secrets = bool(args.apply and args.set_secrets)
@@ -4554,7 +4914,10 @@ def main() -> None:
     outdir.mkdir(parents=True, exist_ok=True)
 
     try:
-        all_orgs = list_orgs(api_base, token, args.enterprise, args.orgs_file)
+        if app is not None:
+            all_orgs = list_orgs_for_app(app, args.orgs_file)
+        else:
+            all_orgs = list_orgs(api_base, token, args.enterprise, args.orgs_file)
     except OrgDiscoveryError as exc:
         print(f"\n[ERROR] {exc}", file=sys.stderr)
         sys.exit(2)
@@ -4592,6 +4955,12 @@ def main() -> None:
         required_scopes=required_github_scopes(
             enterprise=bool(args.enterprise),
             writes_workflows=bool(args.apply and (do_apply_repo or do_set_teams or do_fix_repos)),
+        ),
+        app=app,
+        required_app_permissions=required_app_permissions(
+            writes_workflows=bool(args.apply and (do_apply_repo or do_set_teams or do_fix_repos)),
+            sets_secrets=do_set_secrets,
+            creates_repo=do_apply_repo,
         ),
     )
     if not validation_ok:
@@ -4700,6 +5069,7 @@ def main() -> None:
         do_iac_rbac=not args.skip_iac_rbac,
         secret_visibility=args.secret_visibility,
         stats=RunStats(total_orgs=total_orgs),
+        app=app,
     )
     # Seed from the checkpoint so a resumed run keeps the earlier runs' progress.
     ctx.checkpoint_meta = checkpoint_meta

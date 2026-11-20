@@ -2,3 +2,4 @@ requests>=2.31
 veracode-api-signing>=24.0
 pynacl>=1.5
 PyYAML>=6.0
+PyJWT[crypto]>=2.8
